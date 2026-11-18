@@ -1,0 +1,47 @@
+{
+    "name": "APK Registry",
+    "image": "mcr.microsoft.com/devcontainers/base:trixie",
+    "forwardPorts": [
+        8080
+    ],
+    "portsAttributes": {
+        "8080": {
+            "label": "APK Registry",
+            "onAutoForward": "openBrowser",
+            "protocol": "http"
+        }
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/go:1": {
+            "version": "1.27"
+        },
+        "ghcr.io/devcontainers/features/git:1.3.8": {},
+        "ghcr.io/devcontainers/features/github-cli:1.1.3": {},
+        "ghcr.io/devcontainers-extra/features/pre-commit:2.0.18": {},
+        "ghcr.io/devcontainers/features/docker-in-docker:4.1.2": {
+            "moby": false
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "golang.go",
+                "ms-azuretools.vscode-docker",
+                "editorconfig.editorconfig",
+                "ms-azuretools.vscode-containers"
+            ],
+            "settings": {
+                "go.useLanguageServer": true,
+                "go.formatTool": "gofmt",
+                "go.lintTool": "golint",
+                "go.lintOnSave": "package",
+                "go.vetOnSave": "package",
+                "editor.formatOnSave": true,
+                "editor.rulers": [
+                    120
+                ],
+                "files.trimTrailingWhitespace": true
+            }
+        }
+    }
+}

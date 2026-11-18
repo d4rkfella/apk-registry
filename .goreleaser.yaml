@@ -1,0 +1,87 @@
+version: 2
+project_name: apk-registry
+
+builds:
+  - id: apk-registry
+    main: ./cmd/server
+    binary: apk-registry
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+sboms:
+  - artifacts: archive
+    documents:
+      - "{{ .ArtifactName }}.spdx.json"
+    args:
+      - "$artifact"
+      - "--output"
+      - "spdx-json=$document"
+
+checksum:
+  name_template: "{{ .ProjectName }}_checksums.txt"
+
+signs:
+  - artifacts: checksum
+    cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - "sign-blob"
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^Merge pull request"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-dev.{{ .Timestamp }}"
+
+dockers_v2:
+  - ids:
+      - apk-registry
+    dockerfile: Dockerfile.goreleaser
+    extra_files:
+      - docker-entrypoint.sh
+    images:
+      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}"
+    tags:
+      - "v{{ .Version }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    flags:
+      - "--provenance=true"
+    labels:
+      "org.opencontainers.image.title": "{{ .ProjectName }}"
+      "org.opencontainers.image.version": "{{ .Version }}"
+      "org.opencontainers.image.revision": "{{ .FullCommit }}"
+      "org.opencontainers.image.created": "{{ .Date }}"
+
+docker_signs:
+  - artifacts: all
+    cmd: cosign
+    args:
+      - "sign"
+      - "--upload=true"
+      - "${artifact}@${digest}"
+      - "--yes"

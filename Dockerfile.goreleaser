@@ -1,0 +1,14 @@
+FROM alpine:3.24
+
+RUN apk add --no-cache apk-tools ca-certificates su-exec \
+    && addgroup -S -g 10001 registry \
+    && adduser -S -D -H -u 10001 -G registry registry \
+    && mkdir -p /var/lib/apk-registry \
+    && chown registry:registry /var/lib/apk-registry
+
+ARG TARGETPLATFORM
+COPY --chmod=0755 ${TARGETPLATFORM}/apk-registry /usr/local/bin/apk-registry
+COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint"]
