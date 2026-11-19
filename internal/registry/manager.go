@@ -85,7 +85,7 @@ func NewManager(cfg config.Config, log *slog.Logger) (*Manager, error) {
 		root:       root,
 		repo:       cfg.Repository,
 		indexName:  "APKINDEX.tar.gz",
-		indexer:    apk.Indexer{SigningKey: cfg.SigningKey},
+		indexer:    &apk.Indexer{SigningKey: cfg.SigningKey},
 		maxUpload:  cfg.MaxUploadSize,
 		log:        log,
 		signingKey: signingKey,

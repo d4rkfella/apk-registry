@@ -1,6 +1,9 @@
 package registry
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -10,6 +13,9 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/chainguard-dev/clog"
+	"github.com/d4rkfella/apk-registry/internal/apk"
 )
 
 func TestIndexWorkerBatchesUploadBursts(t *testing.T) {
@@ -174,6 +180,126 @@ func BenchmarkEnqueueAdditionBurst(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func BenchmarkMelangeIndexGeneration(b *testing.B) {
+	for _, existingCount := range []int{100, 1_000, 10_000} {
+		b.Run(fmt.Sprintf("existing-%d", existingCount), func(b *testing.B) {
+			ctx := clog.WithLogger(context.Background(), clog.New(slog.NewTextHandler(io.Discard, nil)))
+			baseRoot := b.TempDir()
+			packageDir := filepath.Join(baseRoot, "os", "x86_64")
+			if err := os.MkdirAll(packageDir, 0755); err != nil {
+				b.Fatal(err)
+			}
+			var compressed bytes.Buffer
+			gzipWriter := gzip.NewWriter(&compressed)
+			for i := 0; i < existingCount; i++ {
+				name := fmt.Sprintf("existing-%05d", i)
+				filename := filepath.Join(packageDir, name+"-1.0-r0.apk")
+				writeIndexBenchmarkAPK(b, filename, name, "x86_64", &compressed, gzipWriter)
+			}
+
+			baseIndexPath := filepath.Join(packageDir, "APKINDEX.tar.gz")
+			indexer := &apk.Indexer{}
+			if err := indexer.BuildV2Merge(ctx, packageDir, "", baseIndexPath, "x86_64"); err != nil {
+				b.Fatalf("build %d-package baseline index: %v", existingCount, err)
+			}
+			baseIndex, err := os.ReadFile(baseIndexPath)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			b.Run("full", func(b *testing.B) {
+				manager := &Manager{
+					root:      baseRoot,
+					repo:      "os",
+					indexName: "APKINDEX.tar.gz",
+					indexer:   indexer,
+					states:    make(map[indexNamespace]*namespaceState),
+				}
+				work := indexWork{full: true}
+				ns := indexNamespace{arch: "x86_64"}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for b.Loop() {
+					published, err := manager.buildAndPublishIndex(ctx, ns, work)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if !published {
+						b.Fatal("full index build was not published")
+					}
+				}
+				b.ReportMetric(float64(existingCount), "existing-pkgs/op")
+			})
+
+			for _, addedCount := range []int{1, 10, 100} {
+				b.Run(fmt.Sprintf("incremental-%d", addedCount), func(b *testing.B) {
+					root := b.TempDir()
+					incrementalDir := filepath.Join(root, "os", "x86_64")
+					if err := os.MkdirAll(incrementalDir, 0755); err != nil {
+						b.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(incrementalDir, "APKINDEX.tar.gz"), baseIndex, 0644); err != nil {
+						b.Fatal(err)
+					}
+					work := indexWork{additions: make(map[string]struct{}, addedCount)}
+					var compressed bytes.Buffer
+					gzipWriter := gzip.NewWriter(&compressed)
+					for i := 0; i < addedCount; i++ {
+						name := fmt.Sprintf("added-%03d", i)
+						filename := name + "-1.0-r0.apk"
+						writeIndexBenchmarkAPK(b, filepath.Join(incrementalDir, filename), name, "x86_64", &compressed, gzipWriter)
+						work.additions[filename] = struct{}{}
+					}
+					manager := &Manager{
+						root:      root,
+						repo:      "os",
+						indexName: "APKINDEX.tar.gz",
+						indexer:   indexer,
+						states:    make(map[indexNamespace]*namespaceState),
+					}
+					ns := indexNamespace{arch: "x86_64"}
+					b.ReportAllocs()
+					b.ResetTimer()
+					for b.Loop() {
+						published, err := manager.buildAndPublishIndex(ctx, ns, work)
+						if err != nil {
+							b.Fatal(err)
+						}
+						if !published {
+							b.Fatal("incremental index build was not published")
+						}
+					}
+					b.ReportMetric(float64(existingCount), "existing-pkgs/op")
+					b.ReportMetric(float64(addedCount), "added-pkgs/op")
+				})
+			}
+		})
+	}
+}
+
+func writeIndexBenchmarkAPK(b *testing.B, filename, name, arch string, compressed *bytes.Buffer, gzipWriter *gzip.Writer) {
+	b.Helper()
+	compressed.Reset()
+	gzipWriter.Reset(compressed)
+	info := fmt.Appendf(nil, "pkgname = %s\npkgver = 1.0-r0\narch = %s\n", name, arch)
+	tarWriter := tar.NewWriter(gzipWriter)
+	if err := tarWriter.WriteHeader(&tar.Header{Name: ".PKGINFO", Mode: 0644, Size: int64(len(info))}); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := tarWriter.Write(info); err != nil {
+		b.Fatal(err)
+	}
+	if err := tarWriter.Close(); err != nil {
+		b.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.WriteFile(filename, compressed.Bytes(), 0644); err != nil {
+		b.Fatal(err)
 	}
 }
 

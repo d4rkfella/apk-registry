@@ -226,11 +226,18 @@ snapshot; publication is atomic, and failed builds are logged and retried. On
 startup, existing package directories are scanned to recover pending indexes.
 For v2, the first build, overwrites, deletes, and recovery use a full rebuild;
 new package uploads are merged into the current index using only the newly
-added packages. Indexes are generated with Melange's Go index library. Optional
-signing uses `APK_REGISTRY_INDEX_SIGNING_KEY`. When a supported architecture is requested
+added packages. Full rebuilds use Melange's Go index library. Incremental merges
+reuse a per-architecture decoded index cache and use apko's APK metadata/archive
+implementation; the cache is refreshed only after generating an output and is
+validated against the published index file. Optional signing uses
+`APK_REGISTRY_INDEX_SIGNING_KEY`. When a supported architecture is requested
 before any packages have been uploaded, the registry creates and serves a valid
 empty index (signed when configured); the first package upload is merged into
 it.
+
+Run `go test ./internal/registry -run '^$' -bench '^BenchmarkMelangeIndexGeneration$' -benchtime=10x -benchmem`
+to compare full rebuilds and 1/10/100-package incremental merges against
+100-, 1,000-, and 10,000-package indexes.
 
 `APK_REGISTRY_STORAGE_ROOT` defaults to `./data`; `APK_REGISTRY_MAX_UPLOAD_SIZE`
 defaults to 1 GiB.

@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	apkoapk "chainguard.dev/apko/pkg/apk/apk"
 	"github.com/d4rkfella/apk-registry/internal/authz"
 	"github.com/d4rkfella/apk-registry/internal/config"
 )
@@ -309,9 +310,22 @@ func TestIndexingDoesNotBlockConcurrentUploadsAndPublishesLatestSnapshot(t *test
 
 func TestV2NewPackageMergesIntoCurrentIndex(t *testing.T) {
 	root := t.TempDir()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyPath := filepath.Join(t.TempDir(), "registry.rsa")
+	privatePEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	})
+	if err := os.WriteFile(privateKeyPath, privatePEM, 0600); err != nil {
+		t.Fatal(err)
+	}
 	cfg := config.Config{
 		StorageRoot: root, Repository: "os",
 		MaxUploadSize: 1 << 20,
+		SigningKey:    privateKeyPath,
 	}
 	manager, err := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -342,12 +356,60 @@ func TestV2NewPackageMergesIntoCurrentIndex(t *testing.T) {
 			strings.Contains(index, "P:foo\n") &&
 			strings.Contains(index, "P:bar\n")
 	})
+	upload("baz")
+	waitFor(t, "cached incremental index merge", func() bool {
+		index, err := readAPKIndex(indexPath)
+		return err == nil &&
+			strings.Contains(index, "P:foo\n") &&
+			strings.Contains(index, "P:bar\n") &&
+			strings.Contains(index, "P:baz\n")
+	})
+	indexFile, err := os.Open(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedIndex, indexErr := apkoapk.IndexFromArchive(indexFile)
+	closeErr := indexFile.Close()
+	if indexErr != nil {
+		t.Fatalf("read cached signed APKINDEX: %v", indexErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if len(signedIndex.Signature) == 0 {
+		t.Fatal("cached incremental index is not signed")
+	}
+	changedTime := time.Now().Add(time.Second)
+	if err := os.Chtimes(indexPath, changedTime, changedTime); err != nil {
+		t.Fatal(err)
+	}
+	upload("qux")
+	waitFor(t, "index reload after external file change", func() bool {
+		index, err := readAPKIndex(indexPath)
+		return err == nil &&
+			strings.Contains(index, "P:foo\n") &&
+			strings.Contains(index, "P:bar\n") &&
+			strings.Contains(index, "P:baz\n") &&
+			strings.Contains(index, "P:qux\n")
+	})
+	if err := manager.Delete(ctx, "os", "x86_64/bar-1.0-r0.apk"); err != nil {
+		t.Fatalf("delete indexed package: %v", err)
+	}
+	waitFor(t, "full rebuild after deletion", func() bool {
+		index, err := readAPKIndex(indexPath)
+		return err == nil &&
+			strings.Contains(index, "P:foo\n") &&
+			!strings.Contains(index, "P:bar\n") &&
+			strings.Contains(index, "P:baz\n") &&
+			strings.Contains(index, "P:qux\n")
+	})
 	index, err := readAPKIndex(indexPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(index, "P:foo\n") || !strings.Contains(index, "P:bar\n") {
-		t.Fatal("incremental index merge did not retain both package records")
+	if !strings.Contains(index, "P:foo\n") || strings.Contains(index, "P:bar\n") ||
+		!strings.Contains(index, "P:baz\n") || !strings.Contains(index, "P:qux\n") {
+		t.Fatal("index merge or full rebuild did not preserve the expected package records")
 	}
 }
 
