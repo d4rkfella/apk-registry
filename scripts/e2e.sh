@@ -47,7 +47,7 @@ start_registry() {
 
   attempt=0
   while [ "$attempt" -lt 30 ]; do
-    if curl -fsS "$BASE/healthz" >/dev/null 2>&1; then
+    if curl -fsS "$BASE/readyz" >/dev/null 2>&1; then
       return
     fi
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then

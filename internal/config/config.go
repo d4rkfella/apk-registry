@@ -13,23 +13,31 @@ import (
 )
 
 type Config struct {
-	ListenAddr    string
-	StorageRoot   string
-	Repository    string
-	PublicRead    *bool
-	PublicURL     string
-	SigningKey    string
-	MaxUploadSize int64
-	AdminUsername string
-	AdminPassword string
+	ListenAddr         string
+	StorageRoot        string
+	Repository         string
+	PublicRead         *bool
+	PublicURL          string
+	SigningKey         string
+	MaxUploadSize      int64
+	AdminUsername      string
+	AdminPassword      string
+	MetricsEnabled     bool
+	MetricsHost        string
+	MetricsPort        int
+	MetricsAuthEnabled bool
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		ListenAddr:    ":8080",
-		StorageRoot:   "./data",
-		Repository:    "os",
-		MaxUploadSize: 1 << 30,
+		ListenAddr:         ":8080",
+		StorageRoot:        "./data",
+		Repository:         "os",
+		MaxUploadSize:      1 << 30,
+		MetricsEnabled:     true,
+		MetricsHost:        "0.0.0.0",
+		MetricsPort:        9094,
+		MetricsAuthEnabled: true,
 	}
 	cfg.ListenAddr = env("APK_REGISTRY_LISTEN_ADDR", cfg.ListenAddr)
 	cfg.StorageRoot = env("APK_REGISTRY_STORAGE_ROOT", cfg.StorageRoot)
@@ -38,8 +46,27 @@ func Load() (Config, error) {
 	cfg.SigningKey = os.Getenv("APK_REGISTRY_INDEX_SIGNING_KEY")
 	cfg.AdminUsername = os.Getenv("APK_REGISTRY_ADMIN_USERNAME")
 	cfg.AdminPassword = os.Getenv("APK_REGISTRY_ADMIN_PASSWORD")
-	if format := os.Getenv("APK_REGISTRY_INDEX_FORMAT"); format != "" && format != "v2" {
-		return Config{}, fmt.Errorf("APK_REGISTRY_INDEX_FORMAT=%q is unsupported; the registry always serves APKINDEX.tar.gz", format)
+	cfg.MetricsHost = env("APK_REGISTRY_METRICS_HOST", cfg.MetricsHost)
+	if raw := os.Getenv("APK_REGISTRY_METRICS_ENABLED"); raw != "" {
+		enabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse APK_REGISTRY_METRICS_ENABLED: %w", err)
+		}
+		cfg.MetricsEnabled = enabled
+	}
+	if raw := os.Getenv("APK_REGISTRY_METRICS_PORT"); raw != "" {
+		port, err := strconv.Atoi(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse APK_REGISTRY_METRICS_PORT: %w", err)
+		}
+		cfg.MetricsPort = port
+	}
+	if raw := os.Getenv("APK_REGISTRY_METRICS_AUTH_ENABLED"); raw != "" {
+		enabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse APK_REGISTRY_METRICS_AUTH_ENABLED: %w", err)
+		}
+		cfg.MetricsAuthEnabled = enabled
 	}
 	if raw := os.Getenv("APK_REGISTRY_MAX_UPLOAD_SIZE"); raw != "" {
 		size, err := strconv.ParseInt(raw, 10, 64)
@@ -78,6 +105,14 @@ func (c Config) Validate() error {
 	if c.MaxUploadSize <= 0 {
 		return errors.New("max_upload_size must be positive")
 	}
+	if c.MetricsEnabled {
+		if c.MetricsHost == "" {
+			return errors.New("APK_REGISTRY_METRICS_HOST must not be empty when metrics are enabled")
+		}
+		if c.MetricsPort < 1 || c.MetricsPort > 65535 {
+			return errors.New("APK_REGISTRY_METRICS_PORT must be between 1 and 65535")
+		}
+	}
 	if !repository.ValidSegment(c.Repository) {
 		return errors.New("repository must be a valid path segment")
 	}
@@ -108,7 +143,7 @@ func ValidateKeyScope(permissions []string) error {
 		return errors.New("permissions are required")
 	}
 	for _, permission := range permissions {
-		if permission != "read" && permission != "deploy" && permission != "delete" {
+		if permission != "read" && permission != "deploy" && permission != "delete" && permission != "metrics" {
 			return fmt.Errorf("unknown permission %q", permission)
 		}
 	}

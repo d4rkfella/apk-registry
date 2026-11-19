@@ -54,7 +54,7 @@ type TokenStore struct {
 	keys     []storedKey
 }
 
-func OpenTokenStore(filename string) (*TokenStore, error) {
+func OpenTokenStore(filename string) (_ *TokenStore, retErr error) {
 	dir := filepath.Dir(filename)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create API key directory: %w", err)
@@ -84,7 +84,11 @@ func OpenTokenStore(filename string) (*TokenStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open API key store: %w", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close API key store: %w", err))
+		}
+	}()
 	info, err := file.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("stat API key store: %w", err)
@@ -240,7 +244,7 @@ func (s *TokenStore) Authenticate(raw string) (*Identity, error) {
 	return nil, errors.New("invalid API key")
 }
 
-func (s *TokenStore) save(keys []storedKey) error {
+func (s *TokenStore) save(keys []storedKey) (retErr error) {
 	records := make([]tokenFileKey, 0, len(keys))
 	for _, key := range keys {
 		records = append(records, tokenFileKey{
@@ -257,22 +261,31 @@ func (s *TokenStore) save(keys []storedKey) error {
 		return fmt.Errorf("create API key store temp file: %w", err)
 	}
 	tempName := temp.Name()
-	defer os.Remove(tempName)
+	closed := false
+	defer func() {
+		if !closed {
+			if err := temp.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("close API key store temp file: %w", err))
+			}
+		}
+		if err := os.Remove(tempName); err != nil && !errors.Is(err, os.ErrNotExist) {
+			retErr = errors.Join(retErr, fmt.Errorf("remove API key store temp file: %w", err))
+		}
+	}()
 	if err := temp.Chmod(0600); err != nil {
-		temp.Close()
 		return fmt.Errorf("secure API key store temp file: %w", err)
 	}
 	if _, err := temp.Write(data); err != nil {
-		temp.Close()
 		return fmt.Errorf("write API key store: %w", err)
 	}
 	if err := temp.Sync(); err != nil {
-		temp.Close()
 		return fmt.Errorf("sync API key store: %w", err)
 	}
 	if err := temp.Close(); err != nil {
+		closed = true
 		return fmt.Errorf("close API key store: %w", err)
 	}
+	closed = true
 	if err := os.Rename(tempName, s.filename); err != nil {
 		return fmt.Errorf("publish API key store: %w", err)
 	}

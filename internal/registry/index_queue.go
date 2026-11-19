@@ -155,12 +155,23 @@ func (m *Manager) runIndexWorker(ctx context.Context) {
 				}
 				continue
 			}
+			buildStarted := time.Now()
 			published, err := m.buildAndPublishIndex(ctx, ns, work)
+			buildDuration := time.Since(buildStarted)
+			outcome := "superseded"
+			if err != nil {
+				outcome = "failure"
+			} else if published {
+				outcome = "success"
+			}
+			if m.metrics != nil {
+				m.metrics.observeIndexBuild(ns.arch, outcome, buildDuration)
+			}
 			if err != nil {
 				if ctx.Err() != nil {
 					return
 				}
-				m.log.Error("package index generation failed", "repository", m.repo, "architecture", ns.arch, "error", err)
+				m.log.Error("APK index build failed", "repository", m.repo, "architecture", ns.arch, "duration_ms", float64(buildDuration.Microseconds())/1000, "retry_delay", 5*time.Second, "error", err)
 				m.retryIndex(ctx, ns, indexWork{full: true})
 				continue
 			}
@@ -168,12 +179,16 @@ func (m *Manager) runIndexWorker(ctx context.Context) {
 				m.enqueueIndex(ns)
 				continue
 			}
+			m.log.Info("APK index published", "repository", m.repo, "architecture", ns.arch, "duration_ms", float64(buildDuration.Microseconds())/1000)
 			m.cancelIndexRetry(ns)
 		}
 	}
 }
 
 func (m *Manager) retryIndex(ctx context.Context, ns indexNamespace, work indexWork) {
+	if m.metrics != nil {
+		m.metrics.observeIndexRetry(ns.arch)
+	}
 	m.queueMu.Lock()
 	m.retrySeq++
 	id := m.retrySeq
@@ -186,7 +201,9 @@ func (m *Manager) retryIndex(ctx context.Context, ns indexNamespace, work indexW
 	m.retrying[ns] = indexRetry{id: id, work: work}
 	m.queueMu.Unlock()
 
+	m.retryWG.Add(1)
 	go func() {
+		defer m.retryWG.Done()
 		timer := time.NewTimer(5 * time.Second)
 		defer timer.Stop()
 		select {
@@ -260,7 +277,7 @@ func (m *Manager) enqueueExisting(ctx context.Context) {
 	}
 }
 
-func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, work indexWork) (bool, error) {
+func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, work indexWork) (published bool, retErr error) {
 	packagePath, err := m.pathFor(path.Join(m.repo, ns.arch, "placeholder.apk"), true)
 	if err != nil {
 		return false, err
@@ -319,9 +336,9 @@ func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, w
 	}
 	snapshotDir := filepath.Join(snapshotRoot, "packages")
 	if err := os.Mkdir(snapshotDir, 0700); err != nil {
+		cleanupErr := removeIndexSnapshot(snapshotRoot)
 		state.mu.RUnlock()
-		os.RemoveAll(snapshotRoot)
-		return false, err
+		return false, errors.Join(err, cleanupErr)
 	}
 	packageCount := 0
 	for _, filename := range packageNames {
@@ -331,23 +348,25 @@ func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, w
 			continue
 		}
 		if err != nil {
+			cleanupErr := removeIndexSnapshot(snapshotRoot)
 			state.mu.RUnlock()
-			os.RemoveAll(snapshotRoot)
-			return false, err
+			return false, errors.Join(err, cleanupErr)
 		}
 		if !info.Mode().IsRegular() {
 			continue
 		}
 		snapshot := filepath.Join(snapshotDir, filename)
 		if err := os.Link(source, snapshot); err != nil {
+			cleanupErr := removeIndexSnapshot(snapshotRoot)
 			state.mu.RUnlock()
-			os.RemoveAll(snapshotRoot)
-			return false, fmt.Errorf("snapshot package %s: %w", filename, err)
+			return false, errors.Join(fmt.Errorf("snapshot package %s: %w", filename, err), cleanupErr)
 		}
 		packageCount++
 	}
 	state.mu.RUnlock()
-	defer os.RemoveAll(snapshotRoot)
+	defer func() {
+		retErr = errors.Join(retErr, removeIndexSnapshot(snapshotRoot))
+	}()
 
 	if packageCount == 0 {
 		if !fullRebuild {
@@ -379,14 +398,21 @@ func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, w
 	}
 	outputPath := outputFile.Name()
 	if err := outputFile.Close(); err != nil {
-		os.Remove(outputPath)
-		return false, err
+		return false, errors.Join(
+			fmt.Errorf("close temporary APK index output: %w", err),
+			removeIndexTempFile(outputPath),
+		)
 	}
 	if err := os.Remove(outputPath); err != nil {
-		return false, err
+		return false, errors.Join(
+			fmt.Errorf("remove temporary APK index output: %w", err),
+			removeIndexTempFile(outputPath),
+		)
 	}
-	defer os.Remove(outputPath)
-	defer os.Remove(outputPath + ".tmp")
+	defer func() {
+		retErr = errors.Join(retErr, removeIndexTempFile(outputPath))
+		retErr = errors.Join(retErr, removeIndexTempFile(outputPath+".tmp"))
+	}()
 
 	if fullRebuild {
 		err = m.indexer.BuildV2Merge(ctx, snapshotDir, "", outputPath, ns.arch)
@@ -408,4 +434,18 @@ func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, w
 		return false, err
 	}
 	return true, nil
+}
+
+func removeIndexSnapshot(root string) error {
+	if err := os.RemoveAll(root); err != nil {
+		return fmt.Errorf("remove index snapshot %s: %w", root, err)
+	}
+	return nil
+}
+
+func removeIndexTempFile(filename string) error {
+	if err := os.Remove(filename); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove temporary index file %s: %w", filename, err)
+	}
+	return nil
 }

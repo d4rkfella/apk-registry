@@ -11,5 +11,5 @@ COPY --from=build /out/apk-registry /usr/local/bin/apk-registry
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint
 RUN mkdir -p /var/lib/apk-registry && chown registry:registry /var/lib/apk-registry
 RUN chmod 0755 /usr/local/bin/docker-entrypoint
-EXPOSE 8080
+EXPOSE 8080 9094
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint"]

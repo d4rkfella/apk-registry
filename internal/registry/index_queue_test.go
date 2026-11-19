@@ -5,18 +5,145 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/chainguard-dev/clog"
 	"github.com/d4rkfella/apk-registry/internal/apk"
+	"github.com/d4rkfella/apk-registry/internal/config"
 )
+
+func TestFailedIndexBuildPreservesPublishedIndex(t *testing.T) {
+	buildErr := errors.New("injected indexer failure")
+	tests := []struct {
+		name             string
+		buildErr         error
+		cancelAfterWrite bool
+		wantErr          error
+	}{
+		{name: "builder error", buildErr: buildErr, wantErr: buildErr},
+		{name: "canceled after output", cancelAfterWrite: true, wantErr: context.Canceled},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			log := slog.New(slog.NewTextHandler(io.Discard, nil))
+			manager, err := NewManager(config.Config{
+				StorageRoot: root, Repository: "os", MaxUploadSize: 1 << 20,
+			}, log)
+			if err != nil {
+				t.Fatal(err)
+			}
+			packageDir := filepath.Join(root, "os", "x86_64")
+			if err := os.MkdirAll(packageDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			emptyDir := filepath.Join(root, "empty")
+			if err := os.MkdirAll(emptyDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			startupCtx := clog.WithLogger(context.Background(), clog.New(slog.NewTextHandler(io.Discard, nil)))
+			indexPath := filepath.Join(packageDir, "APKINDEX.tar.gz")
+			if err := manager.indexer.BuildV2Merge(startupCtx, emptyDir, "", indexPath, "x86_64"); err != nil {
+				t.Fatalf("create previously published index: %v", err)
+			}
+			publishedIndex, err := os.ReadFile(indexPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(packageDir, "package-1.0-r0.apk"), []byte("package"), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			manager.indexer = indexerFunc(func(_ context.Context, _, _, output, _ string) error {
+				if err := os.WriteFile(output, []byte("partial replacement"), 0644); err != nil {
+					return err
+				}
+				if tt.cancelAfterWrite {
+					cancel()
+				}
+				return tt.buildErr
+			})
+
+			published, err := manager.buildAndPublishIndex(ctx, indexNamespace{arch: "x86_64"}, indexWork{full: true})
+			if published || !errors.Is(err, tt.wantErr) {
+				t.Fatalf("build result = (%v, %v), want (false, %v)", published, err, tt.wantErr)
+			}
+			gotIndex, err := os.ReadFile(indexPath)
+			if err != nil {
+				t.Fatalf("read previously published index: %v", err)
+			}
+			if !bytes.Equal(gotIndex, publishedIndex) {
+				t.Fatalf("published index changed after failed build: %q", gotIndex)
+			}
+			if index, err := readAPKIndex(indexPath); err != nil || strings.TrimSpace(index) != "" {
+				t.Fatalf("previously published index is no longer a valid empty index: %q, %v", index, err)
+			}
+			entries, err := os.ReadDir(packageDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 2 {
+				t.Fatalf("temporary index artifacts remain after failed build: %v", entries)
+			}
+		})
+	}
+}
+
+func TestStartupRecoveryRebuildsStaleIndex(t *testing.T) {
+	root := t.TempDir()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager, err := NewManager(config.Config{
+		StorageRoot: root, Repository: "os", MaxUploadSize: 1 << 20,
+	}, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	packageDir := filepath.Join(root, "os", "x86_64")
+	if err := os.MkdirAll(packageDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	emptyDir := filepath.Join(root, "empty")
+	if err := os.MkdirAll(emptyDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	indexPath := filepath.Join(packageDir, "APKINDEX.tar.gz")
+	startupCtx := clog.WithLogger(context.Background(), clog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := manager.indexer.BuildV2Merge(startupCtx, emptyDir, "", indexPath, "x86_64"); err != nil {
+		t.Fatalf("create stale empty index: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(packageDir, "recovered-1.0-r0.apk"),
+		testAPK(t, "recovered", "1.0-r0", "x86_64"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(startupCtx)
+	manager.Start(ctx)
+	defer func() {
+		cancel()
+		manager.Wait()
+	}()
+
+	waitFor(t, "startup recovery of stale index", func() bool {
+		index, err := readAPKIndex(indexPath)
+		return err == nil && strings.Contains(index, "P:recovered\n")
+	})
+}
 
 func TestIndexWorkerBatchesUploadBursts(t *testing.T) {
 	for _, packageCount := range []int{1, 10, 100} {

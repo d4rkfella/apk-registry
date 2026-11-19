@@ -28,21 +28,29 @@ service. Never expose the admin API over plaintext HTTP.
 Local development needs Go and the same admin environment variables:
 
 ```sh
-go run ./cmd/server
+make run
 ```
 
-To smoke-test a running server, use a valid APK and an API key with `deploy`
-permission:
+Useful development checks:
 
 ```sh
-APK=/path/to/package.apk TOKEN="$APK_REGISTRY_TOKEN" make smoke
+make fmt
+make test
+make check
+make race
+make vulncheck
+make build
 ```
 
-Set `BASE`, `REPO`, and `ARCH` to override the defaults.
-The script waits up to 60 seconds for the asynchronously generated index; if
-reads are private, the key must also have `read` permission. Use a package
-version that is not already present, since overwriting requires `delete`
-permission as well.
+`make check` runs formatting validation, golangci-lint, and the unit tests.
+CI pins golangci-lint to v2.15.0; install that version locally before running
+`make check`. Its default linter set includes Staticcheck.
+`make e2e` runs the full package build, signed upload, restart recovery, and
+apko installation test; it requires Docker, Melange, apko, curl, Go, and Python 3.
+`make build` writes the server binary to `bin/apk-registry` by default; override
+`BINARY` to choose another output path.
+`make vulncheck` requires `govulncheck` in `PATH`; CI installs it at a pinned
+version before running the target.
 
 All server configuration variables use the `APK_REGISTRY_` prefix:
 
@@ -57,7 +65,38 @@ All server configuration variables use the `APK_REGISTRY_` prefix:
 | `APK_REGISTRY_STORAGE_ROOT` | `./data` | Package and private API-key storage |
 | `APK_REGISTRY_INDEX_SIGNING_KEY` | unset | Optional PEM RSA private key path ending in `.rsa` |
 | `APK_REGISTRY_MAX_UPLOAD_SIZE` | `1073741824` | Maximum upload size in bytes |
-| `APK_REGISTRY_INDEX_FORMAT` | `v2` | Only `v2` is supported |
+| `APK_REGISTRY_METRICS_ENABLED` | `true` | Run the separate Prometheus metrics listener |
+| `APK_REGISTRY_METRICS_HOST` | `0.0.0.0` | Metrics listener bind host |
+| `APK_REGISTRY_METRICS_PORT` | `9094` | Metrics listener port |
+| `APK_REGISTRY_METRICS_AUTH_ENABLED` | `true` | Require an API key with the `metrics` permission |
+
+## Logs and metrics
+
+The server writes structured JSON logs to stdout. HTTP access events include a
+generated `X-Request-ID`, method, matched route pattern, status, duration, and
+response size. Credentials, authorization headers, and raw request paths are
+not included.
+
+Prometheus metrics are served at `/metrics` on the separate metrics listener
+(default `0.0.0.0:9094`), not on the application listener. They include HTTP
+request counts and durations, index build outcomes and durations, index retries,
+and Go runtime/process metrics. Authentication is enabled by default and
+requires an API key with only the `metrics` permission. Disable it only when
+network policy or firewall rules restrict the listener to trusted monitoring
+systems.
+
+Create a dedicated scrape key through the administrator API:
+
+```sh
+curl --fail-with-body --user "$APK_REGISTRY_ADMIN_USERNAME:$APK_REGISTRY_ADMIN_PASSWORD" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"prometheus","permissions":["metrics"]}' \
+  https://packages.example.com/api/v1/admin/tokens
+```
+
+Configure Prometheus to send the returned key as a bearer token. The key cannot
+read, upload, or delete packages. The metrics listener can be disabled or
+rebound with the `APK_REGISTRY_METRICS_*` settings above.
 
 When index signing is enabled, the registry derives the public key from the
 configured private key and serves it as
@@ -70,6 +109,10 @@ key, such as the output of `melange keygen`, and keep the `.rsa` filename
 suffix. Set `APK_REGISTRY_PUBLIC_URL` to the external origin (for example
 `https://packages.example.com`) when TLS is terminated at a reverse proxy, so
 discovery advertises HTTPS URLs.
+Mount the private key read-only from a secret, and ensure its file permissions
+allow the registry process to read it without granting access to unrelated
+users. The container runs the server as UID 10001; do not bake the key into the
+image.
 
 ## Create and revoke API keys
 
@@ -93,6 +136,7 @@ Available permissions:
 - `deploy`: upload new package versions.
 - `delete`: delete packages and overwrite an existing package (overwriting
   requires both `deploy` and `delete`).
+- `metrics`: scrape Prometheus metrics without package or administrator access.
 
 List key metadata without revealing secrets:
 
@@ -241,7 +285,14 @@ to compare full rebuilds and 1/10/100-package incremental merges against
 
 `APK_REGISTRY_STORAGE_ROOT` defaults to `./data`; `APK_REGISTRY_MAX_UPLOAD_SIZE`
 defaults to 1 GiB.
-`/healthz` returns a minimal health status.
+`/healthz` is a liveness check; `/readyz` reports whether the server is ready
+for traffic and returns `503` during shutdown. Use `/healthz` for the
+Kubernetes liveness probe and `/readyz` for readiness.
+
+On `SIGTERM` or `SIGINT`, the server marks itself unready, stops accepting new
+connections, drains in-flight HTTP requests for up to 20 seconds, then stops
+and waits for the index workers. If shutdown is interrupted, startup recovery
+rebuilds indexes from the persisted packages.
 
 ## Releases
 
@@ -258,7 +309,7 @@ then uses Melange to build and sign a hello-world APK, uploads it to that
 registry, and runs apko again using the registry's automatic signing-key
 discovery. It verifies the package file is present in the resulting image. To
 run it locally, install the matching Melange (`v0.65.0`) and apko (`v1.4.15`)
-versions and ensure Docker is available, then run `./scripts/e2e.sh`.
+versions and ensure Docker is available, then run `make e2e`.
 
 The GoReleaser image build uses `Dockerfile.goreleaser` to package its
 prebuilt binaries. The regular `Dockerfile` remains available for local

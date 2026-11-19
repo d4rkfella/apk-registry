@@ -2,6 +2,7 @@ package apk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -183,13 +184,19 @@ func parsePackages(ctx context.Context, packageDir, arch string) ([]*apkoapk.Pac
 			}
 			info, err := file.Stat()
 			if err != nil {
-				file.Close()
-				return fmt.Errorf("stat package %s: %w", filename, err)
+				closeErr := file.Close()
+				return errors.Join(
+					fmt.Errorf("stat package %s: %w", filename, err),
+					wrapCloseError(filename, closeErr),
+				)
 			}
 			pkg, parseErr := apkoapk.ParsePackage(workCtx, file, uint64(info.Size()))
 			closeErr := file.Close()
 			if parseErr != nil {
-				return fmt.Errorf("parse package %s: %w", filename, parseErr)
+				return errors.Join(
+					fmt.Errorf("parse package %s: %w", filename, parseErr),
+					wrapCloseError(filename, closeErr),
+				)
 			}
 			if closeErr != nil {
 				return fmt.Errorf("close package %s: %w", filename, closeErr)
@@ -205,6 +212,13 @@ func parsePackages(ctx context.Context, packageDir, arch string) ([]*apkoapk.Pac
 		return nil, err
 	}
 	return packages, nil
+}
+
+func wrapCloseError(filename string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("close package %s: %w", filename, err)
 }
 
 func mergePackages(index *apkoapk.APKIndex, additions []*apkoapk.Package) {

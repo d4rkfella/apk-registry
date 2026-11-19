@@ -38,6 +38,7 @@ type Manager struct {
 	maxUpload  int64
 	log        *slog.Logger
 	signingKey *signingKeyInfo
+	metrics    *registryMetrics
 
 	stateMu   sync.Mutex
 	states    map[indexNamespace]*namespaceState
@@ -47,6 +48,8 @@ type Manager struct {
 	retrySeq  uint64
 	wake      chan struct{}
 	startOnce sync.Once
+	workerWG  sync.WaitGroup
+	retryWG   sync.WaitGroup
 }
 
 type Package struct {
@@ -89,6 +92,7 @@ func NewManager(cfg config.Config, log *slog.Logger) (*Manager, error) {
 		maxUpload:  cfg.MaxUploadSize,
 		log:        log,
 		signingKey: signingKey,
+		metrics:    newRegistryMetrics(),
 		states:     make(map[indexNamespace]*namespaceState),
 		pending:    make(map[indexNamespace]indexWork),
 		retrying:   make(map[indexNamespace]indexRetry),
@@ -98,9 +102,22 @@ func NewManager(cfg config.Config, log *slog.Logger) (*Manager, error) {
 
 func (m *Manager) Start(ctx context.Context) {
 	m.startOnce.Do(func() {
-		go m.runIndexWorker(ctx)
-		go m.enqueueExisting(ctx)
+		m.workerWG.Add(2)
+		go func() {
+			defer m.workerWG.Done()
+			m.runIndexWorker(ctx)
+		}()
+		go func() {
+			defer m.workerWG.Done()
+			m.enqueueExisting(ctx)
+		}()
 	})
+}
+
+// Wait waits for the index worker, recovery scan, and scheduled retries to stop.
+func (m *Manager) Wait() {
+	m.workerWG.Wait()
+	m.retryWG.Wait()
 }
 
 func (m *Manager) PrivateStatePath() string {
@@ -134,13 +151,15 @@ func (m *Manager) Read(ctx context.Context, repo, relative string) (*os.File, st
 		return nil, "", err
 	}
 	if err := ctx.Err(); err != nil {
-		file.Close()
+		if closeErr := file.Close(); closeErr != nil {
+			return nil, "", errors.Join(err, fmt.Errorf("close package file: %w", closeErr))
+		}
 		return nil, "", err
 	}
 	return file, filename, nil
 }
 
-func (m *Manager) ensureEmptyIndex(ctx context.Context, repo, relative, arch string) error {
+func (m *Manager) ensureEmptyIndex(ctx context.Context, repo, relative, arch string) (retErr error) {
 	if !repository.SupportedArchitecture(arch) {
 		return os.ErrNotExist
 	}
@@ -181,14 +200,21 @@ func (m *Manager) ensureEmptyIndex(ctx context.Context, repo, relative, arch str
 	}
 	outputPath := outputFile.Name()
 	if err := outputFile.Close(); err != nil {
-		os.Remove(outputPath)
-		return err
+		return errors.Join(
+			fmt.Errorf("close temporary APK index output: %w", err),
+			removeIndexTempFile(outputPath),
+		)
 	}
 	if err := os.Remove(outputPath); err != nil {
-		return err
+		return errors.Join(
+			fmt.Errorf("remove temporary APK index output: %w", err),
+			removeIndexTempFile(outputPath),
+		)
 	}
-	defer os.Remove(outputPath)
-	defer os.Remove(outputPath + ".tmp")
+	defer func() {
+		retErr = errors.Join(retErr, removeIndexTempFile(outputPath))
+		retErr = errors.Join(retErr, removeIndexTempFile(outputPath+".tmp"))
+	}()
 
 	if err := m.indexer.BuildV2Merge(ctx, packageDir, "", outputPath, arch); err != nil {
 		return err
@@ -199,7 +225,7 @@ func (m *Manager) ensureEmptyIndex(ctx context.Context, repo, relative, arch str
 	return os.Rename(outputPath, indexPath)
 }
 
-func (m *Manager) Upload(ctx context.Context, repo, relative string, allowOverwrite bool, body io.Reader) (Package, error) {
+func (m *Manager) Upload(ctx context.Context, repo, relative string, allowOverwrite bool, body io.Reader) (_ Package, retErr error) {
 	if repo != m.repo || !repository.ValidSegment(repo) {
 		return Package{}, errInvalidPackagePath
 	}
@@ -242,7 +268,11 @@ func (m *Manager) Upload(ctx context.Context, repo, relative string, allowOverwr
 		return Package{}, err
 	}
 	tempName := temp.Name()
-	defer os.Remove(tempName)
+	defer func() {
+		if err := os.Remove(tempName); err != nil && !errors.Is(err, os.ErrNotExist) {
+			retErr = errors.Join(retErr, fmt.Errorf("remove temporary package file: %w", err))
+		}
+	}()
 	hash := sha256.New()
 	limit := m.maxUpload
 	if limit < int64(^uint64(0)>>1) {
@@ -258,8 +288,8 @@ func (m *Manager) Upload(ctx context.Context, repo, relative string, allowOverwr
 	if err == nil {
 		err = temp.Sync()
 	}
-	if closeErr := temp.Close(); err == nil {
-		err = closeErr
+	if closeErr := temp.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("close temporary package file: %w", closeErr))
 	}
 	if err != nil {
 		return Package{}, err
@@ -274,7 +304,11 @@ func (m *Manager) Upload(ctx context.Context, repo, relative string, allowOverwr
 	apkPackage, metaErr := apkoapk.ParsePackage(ctx, file, uint64(size))
 	closeErr := file.Close()
 	if metaErr != nil {
-		return Package{}, fmt.Errorf("%w: %v", errInvalidAPK, metaErr)
+		parseErr := fmt.Errorf("%w: %w", errInvalidAPK, metaErr)
+		if closeErr != nil {
+			parseErr = errors.Join(parseErr, fmt.Errorf("close uploaded package: %w", closeErr))
+		}
+		return Package{}, parseErr
 	}
 	if closeErr != nil {
 		return Package{}, closeErr
@@ -414,12 +448,16 @@ func (m *Manager) pathFor(key string, createDirs bool) (string, error) {
 	return current, nil
 }
 
-func isEmptyAPKIndex(filename string) (bool, error) {
+func isEmptyAPKIndex(filename string) (_ bool, retErr error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return false, err
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close APK index: %w", err))
+		}
+	}()
 	index, err := apkoapk.IndexFromArchive(file)
 	if err != nil {
 		return false, err

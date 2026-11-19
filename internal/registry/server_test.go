@@ -45,7 +45,10 @@ func TestAdminScopedKeysAndAutomaticIndexing(t *testing.T) {
 	}
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	manager.Start(workerCtx)
-	t.Cleanup(cancelWorker)
+	t.Cleanup(func() {
+		cancelWorker()
+		manager.Wait()
+	})
 	keys, err := authz.OpenTokenStore(manager.PrivateStatePath())
 	if err != nil {
 		t.Fatal(err)
@@ -61,12 +64,12 @@ func TestAdminScopedKeysAndAutomaticIndexing(t *testing.T) {
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated key creation status = %d, want %d", response.StatusCode, http.StatusUnauthorized)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	response = requestAdmin(t, server.Client(), http.MethodPost, server.URL+"/api/v1/admin/tokens", []byte(`{"name":"ci","permissions":["deploy"]}`), false)
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("invalid admin credentials status = %d, want %d", response.StatusCode, http.StatusUnauthorized)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 
 	deployKey := createKey(t, server.Client(), server.URL, "ci", []string{"deploy"})
 	maintainerKey := createKey(t, server.Client(), server.URL, "manual", []string{"read", "deploy", "delete"})
@@ -89,13 +92,13 @@ func TestAdminScopedKeysAndAutomaticIndexing(t *testing.T) {
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("past API key expiration status = %d, want %d", response.StatusCode, http.StatusBadRequest)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	list := requestAdmin(t, server.Client(), http.MethodGet, server.URL+"/api/v1/admin/tokens", nil, true)
 	if list.StatusCode != http.StatusOK {
 		t.Fatalf("list API keys status = %d, want %d", list.StatusCode, http.StatusOK)
 	}
 	listBody, err := io.ReadAll(list.Body)
-	list.Body.Close()
+	closeResponseBody(t, list.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,17 +127,17 @@ func TestAdminScopedKeysAndAutomaticIndexing(t *testing.T) {
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("non-configured repository status = %d, want %d", response.StatusCode, http.StatusNotFound)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	response = request(t, server.Client(), http.MethodPut, server.URL+packageURL, "", body)
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated upload status = %d, want %d", response.StatusCode, http.StatusUnauthorized)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	response = request(t, server.Client(), http.MethodPut, server.URL+packageURL, deployKey.Token, body)
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("new upload status = %d, want %d", response.StatusCode, http.StatusCreated)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	indexPath := filepath.Join(root, "os", "x86_64", "APKINDEX.tar.gz")
 	waitFor(t, "package index generation", func() bool {
 		_, err := os.Stat(indexPath)
@@ -148,7 +151,7 @@ func TestAdminScopedKeysAndAutomaticIndexing(t *testing.T) {
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("download of a non-package file status = %d, want %d", response.StatusCode, http.StatusBadRequest)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	if err := os.Remove(privateFile); err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +161,7 @@ func TestAdminScopedKeysAndAutomaticIndexing(t *testing.T) {
 		t.Fatalf("public download status = %d, want %d", response.StatusCode, http.StatusOK)
 	}
 	readBody, err := io.ReadAll(response.Body)
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	if err != nil || !bytes.Equal(readBody, body) {
 		t.Fatalf("downloaded APK differs from uploaded APK: %v", err)
 	}
@@ -169,45 +172,45 @@ func TestAdminScopedKeysAndAutomaticIndexing(t *testing.T) {
 	if response.StatusCode != http.StatusUnauthorized || !strings.HasPrefix(challenge, "Basic ") {
 		t.Fatalf("private download without credentials status/challenge = %d/%q, want 401 and a Basic challenge", response.StatusCode, challenge)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	response = request(t, server.Client(), http.MethodGet, server.URL+packageURL, deployKey.Token, nil)
 	if response.StatusCode != http.StatusForbidden {
 		t.Fatalf("private download without read scope status = %d, want %d", response.StatusCode, http.StatusForbidden)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	response = request(t, server.Client(), http.MethodGet, server.URL+packageURL, maintainerKey.Token, nil)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("private download with read scope status = %d, want %d", response.StatusCode, http.StatusOK)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	response = requestBasicToken(t, server.Client(), server.URL+packageURL, maintainerKey.Token)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("private download with Basic API-key credentials status = %d, want %d", response.StatusCode, http.StatusOK)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	publicRead = true
 
 	response = request(t, server.Client(), http.MethodPut, server.URL+packageURL, deployKey.Token, body)
 	if response.StatusCode != http.StatusForbidden {
 		t.Fatalf("overwrite without delete scope status = %d, want %d", response.StatusCode, http.StatusForbidden)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	response = request(t, server.Client(), http.MethodDelete, server.URL+packageURL, deployKey.Token, nil)
 	if response.StatusCode != http.StatusForbidden {
 		t.Fatalf("delete without scope status = %d, want %d", response.StatusCode, http.StatusForbidden)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 
 	response = request(t, server.Client(), http.MethodPut, server.URL+packageURL, maintainerKey.Token, body)
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("overwrite with delete scope status = %d, want %d", response.StatusCode, http.StatusCreated)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	response = request(t, server.Client(), http.MethodDelete, server.URL+packageURL, maintainerKey.Token, nil)
 	if response.StatusCode != http.StatusNoContent {
 		t.Fatalf("delete with scope status = %d, want %d", response.StatusCode, http.StatusNoContent)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	waitFor(t, "empty package index removal", func() bool {
 		_, err := os.Stat(indexPath)
 		return os.IsNotExist(err)
@@ -217,7 +220,7 @@ func TestAdminScopedKeysAndAutomaticIndexing(t *testing.T) {
 	if response.StatusCode != http.StatusNoContent {
 		t.Fatalf("revoke API key status = %d, want %d", response.StatusCode, http.StatusNoContent)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	if _, err := keys.Authenticate(deployKey.Token); err == nil {
 		t.Fatal("revoked API key still authenticated")
 	}
@@ -260,7 +263,10 @@ func TestIndexingDoesNotBlockConcurrentUploadsAndPublishesLatestSnapshot(t *test
 	})
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	manager.Start(workerCtx)
-	t.Cleanup(cancelWorker)
+	t.Cleanup(func() {
+		cancelWorker()
+		manager.Wait()
+	})
 	t.Cleanup(func() { _ = os.WriteFile(releasePath, nil, 0600) })
 
 	bodies := map[string][]byte{
@@ -432,7 +438,9 @@ func TestEmptyRepositoryIndexIsServedAndFirstPackageMerges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read empty repository index: %v", err)
 	}
-	file.Close()
+	if err := file.Close(); err != nil {
+		t.Fatalf("close generated empty index: %v", err)
+	}
 	if name != "APKINDEX.tar.gz" {
 		t.Fatalf("index filename = %q, want APKINDEX.tar.gz", name)
 	}
@@ -484,7 +492,9 @@ func TestStartupRecoverySignsExistingEmptyIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create existing empty index: %v", err)
 	}
-	file.Close()
+	if err := file.Close(); err != nil {
+		t.Fatalf("close existing empty index: %v", err)
+	}
 
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -563,10 +573,10 @@ func TestSigningKeyIsDiscoverableAndServedAtRepositoryRoot(t *testing.T) {
 		JWKSURI string `json:"jwks_uri"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&discovery); err != nil {
-		response.Body.Close()
+		closeResponseBody(t, response.Body)
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	if discovery.JWKSURI != "https://packages.example.com/os/jwks.json" {
 		t.Fatalf("jwks_uri = %q, want configured public URL", discovery.JWKSURI)
 	}
@@ -584,10 +594,10 @@ func TestSigningKeyIsDiscoverableAndServedAtRepositoryRoot(t *testing.T) {
 		} `json:"keys"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&jwks); err != nil {
-		response.Body.Close()
+		closeResponseBody(t, response.Body)
 		t.Fatal(err)
 	}
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	if len(jwks.Keys) != 1 || jwks.Keys[0].KeyType != "RSA" ||
 		jwks.Keys[0].KeyID != "registry" || jwks.Keys[0].Modulus == "" ||
 		jwks.Keys[0].Exponent != "AQAB" {
@@ -599,7 +609,7 @@ func TestSigningKeyIsDiscoverableAndServedAtRepositoryRoot(t *testing.T) {
 		t.Fatalf("public key status = %d, want %d", response.StatusCode, http.StatusOK)
 	}
 	publicPEM, err := io.ReadAll(response.Body)
-	response.Body.Close()
+	closeResponseBody(t, response.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -614,6 +624,243 @@ func TestSigningKeyIsDiscoverableAndServedAtRepositoryRoot(t *testing.T) {
 	servedKey, ok := parsedPublic.(*rsa.PublicKey)
 	if !ok || servedKey.N.Cmp(privateKey.N) != 0 {
 		t.Fatal("served public key does not match the configured private key")
+	}
+}
+
+func TestRequestLoggingAndMetrics(t *testing.T) {
+	var logOutput bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logOutput, nil))
+	cfg := config.Config{
+		StorageRoot: t.TempDir(), Repository: "os", MaxUploadSize: 1 << 20,
+		AdminUsername: "metrics-admin", AdminPassword: "metrics-admin-password",
+		MetricsAuthEnabled: true,
+	}
+	manager, err := NewManager(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := authz.OpenTokenStore(manager.PrivateStatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &Server{
+		Config: cfg, Manager: manager,
+		Authorizer: authz.New(cfg.AdminUsername, cfg.AdminPassword, keys),
+		Keys:       keys,
+		Log:        logger,
+	}
+	server := httptest.NewServer(app.Routes())
+	defer server.Close()
+	metricsServer := httptest.NewServer(app.MetricsHandler())
+	defer metricsServer.Close()
+
+	response, err := server.Client().Get(server.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeResponseBody(t, response.Body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	if response.Header.Get("X-Request-ID") == "" {
+		t.Fatal("health response has no request ID")
+	}
+	var requestLog map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logOutput.Bytes()), &requestLog); err != nil {
+		t.Fatalf("decode request log: %v", err)
+	}
+	if requestLog["msg"] != "HTTP request completed" ||
+		requestLog["route"] != "/healthz" ||
+		requestLog["status"] != float64(http.StatusOK) ||
+		requestLog["request_id"] != response.Header.Get("X-Request-ID") {
+		t.Fatalf("request log is missing expected fields: %v", requestLog)
+	}
+
+	response, err = server.Client().Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeResponseBody(t, response.Body)
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("application listener /metrics status = %d, want %d", response.StatusCode, http.StatusNotFound)
+	}
+
+	response, err = server.Client().Get(metricsServer.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeResponseBody(t, response.Body)
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated metrics status = %d, want %d", response.StatusCode, http.StatusUnauthorized)
+	}
+
+	_, metricsToken, err := keys.Create("prometheus", []string{"metrics"}, nil)
+	if err != nil {
+		t.Fatalf("create metrics-only API key: %v", err)
+	}
+	_, deployToken, err := keys.Create("deployer", []string{"deploy"}, nil)
+	if err != nil {
+		t.Fatalf("create deploy-only API key: %v", err)
+	}
+
+	request, err := http.NewRequest(http.MethodGet, metricsServer.URL+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+metricsToken)
+	response, err = server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics, readErr := io.ReadAll(response.Body)
+	closeResponseBody(t, response.Body)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	if !bytes.Contains(metrics, []byte(`apk_registry_http_requests_total{method="GET",route="/healthz",status="200"} 1`)) {
+		t.Fatalf("metrics do not include the health request: %s", metrics)
+	}
+
+	request, err = http.NewRequest(http.MethodGet, metricsServer.URL+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+deployToken)
+	response, err = server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeResponseBody(t, response.Body)
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("deploy-only metrics status = %d, want %d", response.StatusCode, http.StatusForbidden)
+	}
+
+	request, err = http.NewRequest(http.MethodGet, metricsServer.URL+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.SetBasicAuth(cfg.AdminUsername, cfg.AdminPassword)
+	response, err = server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeResponseBody(t, response.Body)
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("admin Basic credentials metrics status = %d, want %d", response.StatusCode, http.StatusUnauthorized)
+	}
+
+	app.Config.MetricsAuthEnabled = false
+	response, err = server.Client().Get(metricsServer.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeResponseBody(t, response.Body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status with auth disabled = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+}
+
+func TestReadinessEndpointTracksShutdownState(t *testing.T) {
+	server := &Server{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	handler := server.Routes()
+
+	request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("initial readiness status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+
+	server.SetReady(true)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("ready status = %d, want %d", response.Code, http.StatusOK)
+	}
+
+	server.SetReady(false)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("shutdown readiness status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("liveness status = %d, want %d while unready", response.Code, http.StatusOK)
+	}
+}
+
+func TestManagerWaitStopsStartedWorkers(t *testing.T) {
+	manager, err := NewManager(config.Config{
+		StorageRoot: t.TempDir(), Repository: "os", MaxUploadSize: 1 << 20,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	manager.Start(ctx)
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		manager.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("manager workers did not stop after context cancellation")
+	}
+}
+
+func TestIndexBuildMetrics(t *testing.T) {
+	root := t.TempDir()
+	packageDir := filepath.Join(root, "os", "x86_64")
+	if err := os.MkdirAll(packageDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(packageDir, "foo.apk"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{
+		root:      root,
+		repo:      "os",
+		indexName: "APKINDEX.tar.gz",
+		indexer: indexerFunc(func(_ context.Context, _, _, output, _ string) error {
+			return os.WriteFile(output, []byte("index"), 0644)
+		}),
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metrics:  newRegistryMetrics(),
+		states:   make(map[indexNamespace]*namespaceState),
+		pending:  make(map[indexNamespace]indexWork),
+		retrying: make(map[indexNamespace]indexRetry),
+		wake:     make(chan struct{}, 1),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		manager.runIndexWorker(ctx)
+		close(done)
+	}()
+	manager.enqueueIndex(indexNamespace{arch: "x86_64"})
+	metricHandler := manager.metrics.handler()
+	waitFor(t, "successful index build metric", func() bool {
+		recorder := httptest.NewRecorder()
+		metricHandler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		return bytes.Contains(recorder.Body.Bytes(), []byte(`apk_registry_index_builds_total{architecture="x86_64",outcome="success"} 1`))
+	})
+	cancel()
+	<-done
+
+	recorder := httptest.NewRecorder()
+	metricHandler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !bytes.Contains(recorder.Body.Bytes(), []byte(`apk_registry_index_builds_total{architecture="x86_64",outcome="success"} 1`)) {
+		t.Fatalf("metrics do not include the successful index build: %s", recorder.Body.String())
 	}
 }
 
@@ -634,6 +881,83 @@ func TestUploadRejectsUnsupportedArchitecture(t *testing.T) {
 	)
 	if !errors.Is(err, errUnsupportedArchitecture) {
 		t.Fatalf("upload error = %v, want unsupported architecture", err)
+	}
+}
+
+func TestUploadEnforcesSizeLimitAndRemovesPartialFile(t *testing.T) {
+	root := t.TempDir()
+	manager, err := NewManager(config.Config{
+		StorageRoot: root, Repository: "os", MaxUploadSize: 16,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = manager.Upload(
+		context.Background(),
+		"os",
+		"x86_64/package-1.0-r0.apk",
+		false,
+		bytes.NewReader(bytes.Repeat([]byte("x"), 17)),
+	)
+	if !errors.Is(err, errPackageTooLarge) {
+		t.Fatalf("oversized upload error = %v, want package-too-large", err)
+	}
+
+	packageDir := filepath.Join(root, "os", "x86_64")
+	entries, err := os.ReadDir(packageDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("oversized upload left files in package directory: %v", entries)
+	}
+}
+
+func TestUploadRejectsUnsafePathsAndSymlinkedDirectories(t *testing.T) {
+	root := t.TempDir()
+	manager, err := NewManager(config.Config{
+		StorageRoot: root, Repository: "os", MaxUploadSize: 1 << 20,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = manager.Upload(
+		context.Background(),
+		"os",
+		"../escape-1.0-r0.apk",
+		false,
+		bytes.NewReader(testAPK(t, "escape", "1.0-r0", "x86_64")),
+	)
+	if !errors.Is(err, errInvalidPackagePath) {
+		t.Fatalf("traversal upload error = %v, want invalid package path", err)
+	}
+
+	repositoryDir := filepath.Join(root, "os")
+	if err := os.MkdirAll(repositoryDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	outsideDir := t.TempDir()
+	if err := os.Symlink(outsideDir, filepath.Join(repositoryDir, "x86_64")); err != nil {
+		t.Skipf("create symlink for path-safety test: %v", err)
+	}
+	_, err = manager.Upload(
+		context.Background(),
+		"os",
+		"x86_64/package-1.0-r0.apk",
+		false,
+		bytes.NewReader(testAPK(t, "package", "1.0-r0", "x86_64")),
+	)
+	if err == nil || !strings.Contains(err.Error(), "symbolic links are not allowed") {
+		t.Fatalf("upload through a symlinked package directory error = %v, want symlink rejection", err)
+	}
+	entries, err := os.ReadDir(outsideDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("symlinked upload wrote outside the storage root: %v", entries)
 	}
 }
 
@@ -718,18 +1042,26 @@ func (f indexerFunc) BuildV2Merge(ctx context.Context, packageDir, existing, out
 	return f(ctx, packageDir, existing, output, arch)
 }
 
-func readAPKIndex(filename string) (string, error) {
+func readAPKIndex(filename string) (_ string, retErr error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close APK index file: %w", err))
+		}
+	}()
 
 	gz, err := gzip.NewReader(file)
 	if err != nil {
 		return "", err
 	}
-	defer gz.Close()
+	defer func() {
+		if err := gz.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close APK index gzip reader: %w", err))
+		}
+	}()
 
 	tarReader := tar.NewReader(gz)
 	for {
@@ -744,6 +1076,13 @@ func readAPKIndex(filename string) (string, error) {
 	}
 }
 
+func closeResponseBody(t *testing.T, body io.Closer) {
+	t.Helper()
+	if err := body.Close(); err != nil {
+		t.Errorf("close HTTP response body: %v", err)
+	}
+}
+
 func createKey(t *testing.T, client *http.Client, baseURL, name string, permissions []string) createdKey {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{"name": name, "permissions": permissions})
@@ -751,7 +1090,7 @@ func createKey(t *testing.T, client *http.Client, baseURL, name string, permissi
 		t.Fatal(err)
 	}
 	response := requestAdmin(t, client, http.MethodPost, baseURL+"/api/v1/admin/tokens", body, true)
-	defer response.Body.Close()
+	defer closeResponseBody(t, response.Body)
 	if response.StatusCode != http.StatusCreated {
 		responseBody, _ := io.ReadAll(response.Body)
 		t.Fatalf("create API key status = %d, want %d: %s", response.StatusCode, http.StatusCreated, responseBody)
@@ -772,7 +1111,7 @@ func createKeyWithExpiration(t *testing.T, client *http.Client, baseURL, name st
 		t.Fatal(err)
 	}
 	response := requestAdmin(t, client, http.MethodPost, baseURL+"/api/v1/admin/tokens", body, true)
-	defer response.Body.Close()
+	defer closeResponseBody(t, response.Body)
 	if response.StatusCode != http.StatusCreated {
 		responseBody, _ := io.ReadAll(response.Body)
 		t.Fatalf("create expiring API key status = %d, want %d: %s", response.StatusCode, http.StatusCreated, responseBody)

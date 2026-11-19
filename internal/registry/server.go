@@ -2,7 +2,10 @@ package registry
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,10 +15,12 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/d4rkfella/apk-registry/internal/authz"
 	"github.com/d4rkfella/apk-registry/internal/config"
+	"github.com/felixge/httpsnoop"
 )
 
 type Server struct {
@@ -24,6 +29,7 @@ type Server struct {
 	Authorizer *authz.Authorizer
 	Keys       *authz.TokenStore
 	Log        *slog.Logger
+	ready      atomic.Bool
 }
 
 type createAPIKeyRequest struct {
@@ -48,20 +54,75 @@ func (s *Server) Routes() http.Handler {
 	if s.Log == nil {
 		s.Log = slog.Default()
 	}
+	metrics := s.metricsCollector()
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+	register := func(pattern string, handler http.Handler) {
+		_, route, _ := strings.Cut(pattern, " ")
+		mux.Handle(pattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if info, ok := r.Context().Value(requestInfoContextKey{}).(*requestInfo); ok {
+				info.route = route
+			}
+			handler.ServeHTTP(w, r)
+		}))
+	}
+	register("GET /healthz", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
+	}))
+	register("GET /readyz", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !s.ready.Load() {
+			jsonResponse(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready"})
+			return
+		}
+		jsonResponse(w, http.StatusOK, map[string]string{"status": "ready"})
+	}))
+	register("GET /api/v1/admin/tokens", http.HandlerFunc(s.listAPIKeys))
+	register("POST /api/v1/admin/tokens", http.HandlerFunc(s.createAPIKey))
+	register("DELETE /api/v1/admin/tokens/{id}", http.HandlerFunc(s.revokeAPIKey))
+	register("GET /{repo}/apk-configuration", http.HandlerFunc(s.apkConfiguration))
+	register("GET /{repo}/jwks.json", http.HandlerFunc(s.jwks))
+	register("GET /{repo}/{filename}", http.HandlerFunc(s.readSigningPublicKey))
+	register("GET /{repo}/{path...}", http.HandlerFunc(s.readPackage))
+	register("PUT /{repo}/{path...}", http.HandlerFunc(s.uploadPackage))
+	register("DELETE /{repo}/{path...}", http.HandlerFunc(s.deletePackage))
+	return logging(mux, s.Log, metrics)
+}
+
+// MetricsHandler serves Prometheus metrics on a dedicated HTTP listener.
+func (s *Server) MetricsHandler() http.Handler {
+	if s.Log == nil {
+		s.Log = slog.Default()
+	}
+	metrics := s.metricsCollector()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		if s.Config.MetricsAuthEnabled {
+			identity, ok := s.authenticate(w, r)
+			if !ok {
+				return
+			}
+			if !s.Authorizer.Authorize(identity, "metrics") {
+				http.Error(w, "metrics permission required", http.StatusForbidden)
+				return
+			}
+		}
+		metrics.handler().ServeHTTP(w, r)
 	})
-	mux.HandleFunc("GET /api/v1/admin/tokens", s.listAPIKeys)
-	mux.HandleFunc("POST /api/v1/admin/tokens", s.createAPIKey)
-	mux.HandleFunc("DELETE /api/v1/admin/tokens/{id}", s.revokeAPIKey)
-	mux.HandleFunc("GET /{repo}/apk-configuration", s.apkConfiguration)
-	mux.HandleFunc("GET /{repo}/jwks.json", s.jwks)
-	mux.HandleFunc("GET /{repo}/{filename}", s.readSigningPublicKey)
-	mux.HandleFunc("GET /{repo}/{path...}", s.readPackage)
-	mux.HandleFunc("PUT /{repo}/{path...}", s.uploadPackage)
-	mux.HandleFunc("DELETE /{repo}/{path...}", s.deletePackage)
-	return logging(mux, s.Log)
+	return logging(mux, s.Log, metrics)
+}
+
+func (s *Server) metricsCollector() *registryMetrics {
+	if s.Manager == nil {
+		return newRegistryMetrics()
+	}
+	if s.Manager.metrics == nil {
+		s.Manager.metrics = newRegistryMetrics()
+	}
+	return s.Manager.metrics
+}
+
+// SetReady controls whether the readiness endpoint reports the server ready.
+func (s *Server) SetReady(ready bool) {
+	s.ready.Store(ready)
 }
 
 func (s *Server) listAPIKeys(w http.ResponseWriter, r *http.Request) {
@@ -157,7 +218,6 @@ func (s *Server) readPackage(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	defer file.Close()
 	switch {
 	case strings.HasSuffix(filename, ".apk"):
 		w.Header().Set("Content-Type", "application/vnd.alpine.apk")
@@ -165,6 +225,9 @@ func (s *Server) readPackage(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/gzip")
 	}
 	http.ServeContent(w, r, filename, time.Time{}, file)
+	if err := file.Close(); err != nil {
+		s.Log.Error("close package file", "repository", repo, "filename", filename, "error", err)
+	}
 }
 
 func (s *Server) apkConfiguration(w http.ResponseWriter, r *http.Request) {
@@ -369,10 +432,54 @@ func jsonResponse(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func logging(next http.Handler, log *slog.Logger) http.Handler {
+type requestInfoContextKey struct{}
+
+type requestInfo struct {
+	route string
+}
+
+func logging(next http.Handler, log *slog.Logger, metrics *registryMetrics) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Info("request", "method", r.Method, "path", r.URL.Path, "duration", time.Since(start))
+		requestID, err := newRequestID()
+		if err != nil {
+			log.Error("generate request ID", "error", err)
+		} else {
+			w.Header().Set("X-Request-ID", requestID)
+		}
+		info := &requestInfo{route: "unmatched"}
+		r = r.WithContext(context.WithValue(r.Context(), requestInfoContextKey{}, info))
+		result := httpsnoop.CaptureMetrics(next, w, r)
+		duration := time.Since(start)
+		status := result.Code
+		if status == 0 {
+			status = http.StatusOK
+		}
+		if metrics != nil {
+			metrics.observeRequest(r.Method, info.route, status, duration)
+		}
+		attrs := []any{
+			"method", r.Method,
+			"route", info.route,
+			"status", status,
+			"duration_ms", float64(duration.Microseconds()) / 1000,
+			"response_bytes", result.Written,
+		}
+		if requestID != "" {
+			attrs = append(attrs, "request_id", requestID)
+		}
+		if status >= http.StatusInternalServerError {
+			log.Error("HTTP request failed", attrs...)
+		} else {
+			log.Info("HTTP request completed", attrs...)
+		}
 	})
+}
+
+func newRequestID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(id[:]), nil
 }
