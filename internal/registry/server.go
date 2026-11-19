@@ -56,34 +56,25 @@ func (s *Server) Routes() http.Handler {
 	}
 	metrics := s.metricsCollector()
 	mux := http.NewServeMux()
-	register := func(pattern string, handler http.Handler) {
-		_, route, _ := strings.Cut(pattern, " ")
-		mux.Handle(pattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if info, ok := r.Context().Value(requestInfoContextKey{}).(*requestInfo); ok {
-				info.route = route
-			}
-			handler.ServeHTTP(w, r)
-		}))
-	}
-	register("GET /healthz", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	registerRoute(mux, "GET /healthz", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
 	}))
-	register("GET /readyz", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	registerRoute(mux, "GET /readyz", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if !s.ready.Load() {
 			jsonResponse(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready"})
 			return
 		}
 		jsonResponse(w, http.StatusOK, map[string]string{"status": "ready"})
 	}))
-	register("GET /api/v1/admin/tokens", http.HandlerFunc(s.listAPIKeys))
-	register("POST /api/v1/admin/tokens", http.HandlerFunc(s.createAPIKey))
-	register("DELETE /api/v1/admin/tokens/{id}", http.HandlerFunc(s.revokeAPIKey))
-	register("GET /{repo}/apk-configuration", http.HandlerFunc(s.apkConfiguration))
-	register("GET /{repo}/jwks.json", http.HandlerFunc(s.jwks))
-	register("GET /{repo}/{filename}", http.HandlerFunc(s.readSigningPublicKey))
-	register("GET /{repo}/{path...}", http.HandlerFunc(s.readPackage))
-	register("PUT /{repo}/{path...}", http.HandlerFunc(s.uploadPackage))
-	register("DELETE /{repo}/{path...}", http.HandlerFunc(s.deletePackage))
+	registerRoute(mux, "GET /api/v1/admin/tokens", http.HandlerFunc(s.listAPIKeys))
+	registerRoute(mux, "POST /api/v1/admin/tokens", http.HandlerFunc(s.createAPIKey))
+	registerRoute(mux, "DELETE /api/v1/admin/tokens/{id}", http.HandlerFunc(s.revokeAPIKey))
+	registerRoute(mux, "GET /{repo}/apk-configuration", http.HandlerFunc(s.apkConfiguration))
+	registerRoute(mux, "GET /{repo}/jwks.json", http.HandlerFunc(s.jwks))
+	registerRoute(mux, "GET /{repo}/{filename}", http.HandlerFunc(s.readSigningPublicKey))
+	registerRoute(mux, "GET /{repo}/{path...}", http.HandlerFunc(s.readPackage))
+	registerRoute(mux, "PUT /{repo}/{path...}", http.HandlerFunc(s.uploadPackage))
+	registerRoute(mux, "DELETE /{repo}/{path...}", http.HandlerFunc(s.deletePackage))
 	return logging(mux, s.Log, metrics)
 }
 
@@ -94,7 +85,7 @@ func (s *Server) MetricsHandler() http.Handler {
 	}
 	metrics := s.metricsCollector()
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+	registerRoute(mux, "GET /metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.Config.MetricsAuthEnabled {
 			identity, ok := s.authenticate(w, r)
 			if !ok {
@@ -106,7 +97,7 @@ func (s *Server) MetricsHandler() http.Handler {
 			}
 		}
 		metrics.handler().ServeHTTP(w, r)
-	})
+	}))
 	return logging(mux, s.Log, metrics)
 }
 
@@ -123,6 +114,16 @@ func (s *Server) metricsCollector() *registryMetrics {
 // SetReady controls whether the readiness endpoint reports the server ready.
 func (s *Server) SetReady(ready bool) {
 	s.ready.Store(ready)
+}
+
+func registerRoute(mux *http.ServeMux, pattern string, handler http.Handler) {
+	_, route, _ := strings.Cut(pattern, " ")
+	mux.Handle(pattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if info, ok := r.Context().Value(requestInfoContextKey{}).(*requestInfo); ok {
+			info.route = route
+		}
+		handler.ServeHTTP(w, r)
+	}))
 }
 
 func (s *Server) listAPIKeys(w http.ResponseWriter, r *http.Request) {
@@ -458,9 +459,14 @@ func logging(next http.Handler, log *slog.Logger, metrics *registryMetrics) http
 		if metrics != nil {
 			metrics.observeRequest(r.Method, info.route, status, duration)
 		}
+		path := r.URL.EscapedPath()
+		if len(path) > 256 {
+			path = path[:256] + "..."
+		}
 		attrs := []any{
 			"method", r.Method,
 			"route", info.route,
+			"path", path,
 			"status", status,
 			"duration_ms", float64(duration.Microseconds()) / 1000,
 			"response_bytes", result.Written,

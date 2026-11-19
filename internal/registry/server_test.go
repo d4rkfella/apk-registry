@@ -671,9 +671,25 @@ func TestRequestLoggingAndMetrics(t *testing.T) {
 	}
 	if requestLog["msg"] != "HTTP request completed" ||
 		requestLog["route"] != "/healthz" ||
+		requestLog["path"] != "/healthz" ||
 		requestLog["status"] != float64(http.StatusOK) ||
 		requestLog["request_id"] != response.Header.Get("X-Request-ID") {
 		t.Fatalf("request log is missing expected fields: %v", requestLog)
+	}
+
+	response, err = server.Client().Get(server.URL + "/no-such-route?secret=query-value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeResponseBody(t, response.Body)
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown route status = %d, want %d", response.StatusCode, http.StatusNotFound)
+	}
+	if !strings.Contains(logOutput.String(), `"path":"/no-such-route"`) {
+		t.Fatal("request log does not include the concrete path for an unmatched route")
+	}
+	if strings.Contains(logOutput.String(), "query-value") {
+		t.Fatal("request log includes a query string")
 	}
 
 	response, err = server.Client().Get(server.URL + "/metrics")
@@ -722,6 +738,9 @@ func TestRequestLoggingAndMetrics(t *testing.T) {
 	}
 	if !bytes.Contains(metrics, []byte(`apk_registry_http_requests_total{method="GET",route="/healthz",status="200"} 1`)) {
 		t.Fatalf("metrics do not include the health request: %s", metrics)
+	}
+	if !strings.Contains(logOutput.String(), `"route":"/metrics"`) {
+		t.Fatal("metrics listener request log does not include the /metrics route")
 	}
 
 	request, err = http.NewRequest(http.MethodGet, metricsServer.URL+"/metrics", nil)

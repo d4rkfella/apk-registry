@@ -73,9 +73,11 @@ All server configuration variables use the `APK_REGISTRY_` prefix:
 ## Logs and metrics
 
 The server writes structured JSON logs to stdout. HTTP access events include a
-generated `X-Request-ID`, method, matched route pattern, status, duration, and
-response size. Credentials, authorization headers, and raw request paths are
-not included.
+generated `X-Request-ID`, method, matched route pattern, request path, status,
+duration, and response size. The path is capped at 256 characters and excludes
+the query string; credentials and authorization headers are not logged. Request
+paths can contain package names. Metrics continue to use route patterns to avoid
+high-cardinality labels.
 
 Prometheus metrics are served at `/metrics` on the separate metrics listener
 (default `0.0.0.0:9094`), not on the application listener. They include HTTP
