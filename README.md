@@ -14,13 +14,13 @@ Set an administrator username and a strong password (at least 16 characters),
 then start the server:
 
 ```sh
-export REGISTRY_ADMIN_USERNAME=admin
-export REGISTRY_ADMIN_PASSWORD="$(openssl rand -hex 32)"
+export APK_REGISTRY_ADMIN_USERNAME=admin
+export APK_REGISTRY_ADMIN_PASSWORD="$(openssl rand -hex 32)"
 docker compose up --build
 ```
 
 The service listens on port 8080 and stores packages and API key metadata in
-the persistent `packages` volume. `REGISTRY_REPOSITORY` selects the single
+the persistent `packages` volume. `APK_REGISTRY_REPOSITORY` selects the single
 repository URL prefix and defaults to `os`. The Compose port is bound to
 localhost; terminate TLS at a trusted reverse proxy before exposing the
 service. Never expose the admin API over plaintext HTTP.
@@ -44,19 +44,20 @@ reads are private, the key must also have `read` permission. Use a package
 version that is not already present, since overwriting requires `delete`
 permission as well.
 
-All configuration is through environment variables; there is no config file:
+All server configuration variables use the `APK_REGISTRY_` prefix:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `REGISTRY_ADMIN_USERNAME` | required | Admin API username |
-| `REGISTRY_ADMIN_PASSWORD` | required | Admin API password, at least 16 characters |
-| `REGISTRY_REPOSITORY` | `os` | The single repository URL prefix |
-| `REGISTRY_PUBLIC_READ` | `true` | Set to `false` to require `read` permission |
-| `REGISTRY_PUBLIC_URL` | unset | Public HTTP(S) origin used for signing-key discovery |
-| `LISTEN_ADDR` | `:8080` | HTTP listen address |
-| `STORAGE_ROOT` | `./data` | Package and private API-key storage |
-| `APK_INDEX_SIGNING_KEY` | unset | Optional PEM RSA private key path ending in `.rsa` |
-| `MAX_UPLOAD_SIZE` | `1073741824` | Maximum upload size in bytes |
+| `APK_REGISTRY_ADMIN_USERNAME` | required | Admin API username |
+| `APK_REGISTRY_ADMIN_PASSWORD` | required | Admin API password, at least 16 characters |
+| `APK_REGISTRY_REPOSITORY` | `os` | The single repository URL prefix |
+| `APK_REGISTRY_PUBLIC_READ` | `true` | Set to `false` to require `read` permission |
+| `APK_REGISTRY_PUBLIC_URL` | unset | Public HTTP(S) origin used for signing-key discovery |
+| `APK_REGISTRY_LISTEN_ADDR` | `:8080` | HTTP listen address |
+| `APK_REGISTRY_STORAGE_ROOT` | `./data` | Package and private API-key storage |
+| `APK_REGISTRY_INDEX_SIGNING_KEY` | unset | Optional PEM RSA private key path ending in `.rsa` |
+| `APK_REGISTRY_MAX_UPLOAD_SIZE` | `1073741824` | Maximum upload size in bytes |
+| `APK_REGISTRY_INDEX_FORMAT` | `v2` | Only `v2` is supported |
 
 When index signing is enabled, the registry derives the public key from the
 configured private key and serves it as
@@ -66,7 +67,7 @@ registry's JWKS endpoint. A signing key named `registry.rsa` is therefore
 published as `/<repository>/registry.rsa.pub`; no separate public-key secret
 or manual apko `keyring` entry is needed. Use an unencrypted PKCS#1 RSA PEM
 key, such as the output of `melange keygen`, and keep the `.rsa` filename
-suffix. Set `REGISTRY_PUBLIC_URL` to the external origin (for example
+suffix. Set `APK_REGISTRY_PUBLIC_URL` to the external origin (for example
 `https://packages.example.com`) when TLS is terminated at a reverse proxy, so
 discovery advertises HTTPS URLs.
 
@@ -76,7 +77,7 @@ Create a key with only the permissions it needs. The plaintext value is
 returned once; the server stores only its SHA-256 hash:
 
 ```sh
-curl --fail-with-body --user "$REGISTRY_ADMIN_USERNAME:$REGISTRY_ADMIN_PASSWORD" \
+curl --fail-with-body --user "$APK_REGISTRY_ADMIN_USERNAME:$APK_REGISTRY_ADMIN_PASSWORD" \
   -H 'Content-Type: application/json' \
   -d '{"name":"github-release","permissions":["deploy"],"expires_at":"2027-01-01T00:00:00Z"}' \
   https://packages.example.com/api/v1/admin/tokens
@@ -96,14 +97,14 @@ Available permissions:
 List key metadata without revealing secrets:
 
 ```sh
-curl --fail-with-body --user "$REGISTRY_ADMIN_USERNAME:$REGISTRY_ADMIN_PASSWORD" \
+curl --fail-with-body --user "$APK_REGISTRY_ADMIN_USERNAME:$APK_REGISTRY_ADMIN_PASSWORD" \
   https://packages.example.com/api/v1/admin/tokens
 ```
 
 Revoke a key by its returned `id`:
 
 ```sh
-curl --fail-with-body --user "$REGISTRY_ADMIN_USERNAME:$REGISTRY_ADMIN_PASSWORD" \
+curl --fail-with-body --user "$APK_REGISTRY_ADMIN_USERNAME:$APK_REGISTRY_ADMIN_PASSWORD" \
   -X DELETE https://packages.example.com/api/v1/admin/tokens/KEY_ID
 ```
 
@@ -145,7 +146,7 @@ curl --fail-with-body -X DELETE \
   https://packages.example.com/os/x86_64/foo-1.2.3-r0.apk
 ```
 
-Unauthenticated reads work by default. Set `REGISTRY_PUBLIC_READ=false` to
+Unauthenticated reads work by default. Set `APK_REGISTRY_PUBLIC_READ=false` to
 require a key with `read` permission. There are no directory listings or package
 management UI. Uploads are parsed with apko and checked against the requested
 filename and architecture before they are accepted.
@@ -224,12 +225,13 @@ startup, existing package directories are scanned to recover pending indexes.
 For v2, the first build, overwrites, deletes, and recovery use a full rebuild;
 new package uploads are merged into the current index using only the newly
 added packages. Indexes are generated with Melange's Go index library. Optional
-signing uses `APK_INDEX_SIGNING_KEY`. When a supported architecture is requested
+signing uses `APK_REGISTRY_INDEX_SIGNING_KEY`. When a supported architecture is requested
 before any packages have been uploaded, the registry creates and serves a valid
 empty index (signed when configured); the first package upload is merged into
 it.
 
-`STORAGE_ROOT` defaults to `./data`; `MAX_UPLOAD_SIZE` defaults to 1 GiB.
+`APK_REGISTRY_STORAGE_ROOT` defaults to `./data`; `APK_REGISTRY_MAX_UPLOAD_SIZE`
+defaults to 1 GiB.
 `/healthz` returns a minimal health status.
 
 ## Releases

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-storage_root="${STORAGE_ROOT:-/var/lib/apk-registry}"
+storage_root="${APK_REGISTRY_STORAGE_ROOT:-/var/lib/apk-registry}"
 mkdir -p "$storage_root"
 if [ "$(stat -c '%u' "$storage_root")" != "10001" ]; then
   chown -R registry:registry "$storage_root"

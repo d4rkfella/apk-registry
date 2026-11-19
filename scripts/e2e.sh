@@ -4,17 +4,22 @@ set -eu
 ROOT_DIR=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
 MELANGE="${MELANGE:-melange}"
 APKO="${APKO:-apko}"
-E2E_REPOSITORY="${E2E_REPOSITORY:-e2e-os}"
-INDEX_TIMEOUT="${INDEX_TIMEOUT:-60}"
+E2E_REPOSITORY="${APK_REGISTRY_E2E_REPOSITORY:-e2e-os}"
+INDEX_TIMEOUT="${APK_REGISTRY_E2E_INDEX_TIMEOUT:-60}"
 TMP_DIR=$(mktemp -d)
 SERVER_PID=
 LOG_TAIL_PID=
 
-cleanup() {
+stop_registry() {
   if [ -n "$SERVER_PID" ]; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=
   fi
+}
+
+cleanup() {
+  stop_registry
   if [ -n "$LOG_TAIL_PID" ]; then
     kill "$LOG_TAIL_PID" 2>/dev/null || true
     wait "$LOG_TAIL_PID" 2>/dev/null || true
@@ -22,6 +27,54 @@ cleanup() {
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
+
+start_registry() {
+  (
+    APK_REGISTRY_LISTEN_ADDR="127.0.0.1:$PORT" \
+    APK_REGISTRY_STORAGE_ROOT="$TMP_DIR/registry-data" \
+    APK_REGISTRY_REPOSITORY="$E2E_REPOSITORY" \
+    APK_REGISTRY_ADMIN_USERNAME="$ADMIN_USER" \
+    APK_REGISTRY_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+    APK_REGISTRY_PUBLIC_URL="$BASE" \
+    APK_REGISTRY_INDEX_SIGNING_KEY="$SIGNING_KEY" \
+    "$TMP_DIR/apk-registry" >>"$TMP_DIR/registry.log" 2>&1
+  ) &
+  SERVER_PID=$!
+  if [ -z "$LOG_TAIL_PID" ]; then
+    tail -n +1 -f "$TMP_DIR/registry.log" &
+    LOG_TAIL_PID=$!
+  fi
+
+  attempt=0
+  while [ "$attempt" -lt 30 ]; do
+    if curl -fsS "$BASE/healthz" >/dev/null 2>&1; then
+      return
+    fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "Registry exited before becoming healthy." >&2
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  echo "Registry did not become healthy." >&2
+  return 1
+}
+
+has_hello_world_package() {
+  python3 - "$1" 2>/dev/null <<'PY'
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "r:gz") as archive:
+    for member in archive.getmembers():
+        if member.isfile():
+            contents = archive.extractfile(member).read()
+            if b"P:hello-world\n" in contents:
+                raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
 
 for tool in "$MELANGE" "$APKO" docker curl go python3 tail; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -59,36 +112,8 @@ if [ -z "$APK" ]; then
 fi
 
 printf '\n%s\n' '== start registry with signed indexes =='
-(
-  LISTEN_ADDR="127.0.0.1:$PORT" \
-  STORAGE_ROOT="$TMP_DIR/registry-data" \
-  REGISTRY_REPOSITORY="$E2E_REPOSITORY" \
-  REGISTRY_ADMIN_USERNAME="$ADMIN_USER" \
-  REGISTRY_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
-  REGISTRY_PUBLIC_URL="$BASE" \
-  APK_INDEX_SIGNING_KEY="$SIGNING_KEY" \
-  "$TMP_DIR/apk-registry" >"$TMP_DIR/registry.log" 2>&1
-) &
-SERVER_PID=$!
-tail -n +1 -f "$TMP_DIR/registry.log" &
-LOG_TAIL_PID=$!
-
-attempt=0
-while [ "$attempt" -lt 30 ]; do
-  if curl -fsS "$BASE/healthz" >/dev/null 2>&1; then
-    break
-  fi
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo "Registry exited before becoming healthy." >&2
-    exit 1
-  fi
-  attempt=$((attempt + 1))
-  sleep 1
-done
-if [ "$attempt" -eq 30 ]; then
-  echo "Registry did not become healthy." >&2
-  exit 1
-fi
+: >"$TMP_DIR/registry.log"
+start_registry
 
 cat >"$TMP_DIR/empty-apko.yaml" <<EOF
 contents:
@@ -135,7 +160,8 @@ curl --fail-with-body --silent --show-error \
 printf '\n%s\n' '== wait for signed repository index =='
 attempt=0
 while [ "$attempt" -lt "$INDEX_TIMEOUT" ]; do
-  if curl -fsS -o /dev/null "$BASE/$E2E_REPOSITORY/x86_64/APKINDEX.tar.gz" 2>/dev/null; then
+  if curl -fsS -o "$TMP_DIR/APKINDEX.tar.gz" "$BASE/$E2E_REPOSITORY/x86_64/APKINDEX.tar.gz" 2>/dev/null &&
+    has_hello_world_package "$TMP_DIR/APKINDEX.tar.gz"; then
     break
   fi
   attempt=$((attempt + 1))
@@ -143,6 +169,25 @@ while [ "$attempt" -lt "$INDEX_TIMEOUT" ]; do
 done
 if [ "$attempt" -eq "$INDEX_TIMEOUT" ]; then
   echo "Repository index did not become available." >&2
+  exit 1
+fi
+
+printf '\n%s\n' '== restart registry and verify package persistence =='
+stop_registry
+rm "$TMP_DIR/registry-data/$E2E_REPOSITORY/x86_64/APKINDEX.tar.gz"
+start_registry
+
+attempt=0
+while [ "$attempt" -lt "$INDEX_TIMEOUT" ]; do
+  if curl -fsS -o "$TMP_DIR/recovered-APKINDEX.tar.gz" "$BASE/$E2E_REPOSITORY/x86_64/APKINDEX.tar.gz" 2>/dev/null &&
+    has_hello_world_package "$TMP_DIR/recovered-APKINDEX.tar.gz"; then
+    break
+  fi
+  attempt=$((attempt + 1))
+  sleep 1
+done
+if [ "$attempt" -eq "$INDEX_TIMEOUT" ]; then
+  echo "Registry did not recover the package index after restart." >&2
   exit 1
 fi
 
@@ -156,7 +201,7 @@ archs:
   - x86_64
 EOF
 
-printf '\n%s\n' '== install package with apko =='
+printf '\n%s\n' '== discover signing key and install recovered package with apko =='
 "$APKO" build \
   --arch x86_64 \
   --sbom-path "$TMP_DIR" \
@@ -185,4 +230,4 @@ if not found:
 print(f"Verified package file in apko image: {target}")
 PY
 
-printf '\n%s\n' 'End-to-end package build, signed upload, index verification, and apko installation succeeded.'
+printf '\n%s\n' 'End-to-end package build, signed upload, restart recovery, and apko installation succeeded.'
