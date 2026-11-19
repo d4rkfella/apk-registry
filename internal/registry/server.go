@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -219,16 +220,31 @@ func (s *Server) readPackage(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			s.Log.Error("close package file", "repository", repo, "filename", filename, "error", err)
+		}
+	}()
+	fileInfo, err := file.Stat()
+	if err != nil {
+		s.Log.Error("stat package file", "repository", repo, "filename", filename, "error", err)
+		http.Error(w, "package file unavailable", http.StatusInternalServerError)
+		return
+	}
 	switch {
 	case strings.HasSuffix(filename, ".apk"):
 		w.Header().Set("Content-Type", "application/vnd.alpine.apk")
 	case filename == "APKINDEX.tar.gz":
 		w.Header().Set("Content-Type", "application/gzip")
+		digest := sha256.New()
+		if _, err := io.Copy(digest, io.NewSectionReader(file, 0, fileInfo.Size())); err != nil {
+			s.Log.Error("hash package index", "repository", repo, "filename", filename, "error", err)
+			http.Error(w, "package index unavailable", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("ETag", `"`+hex.EncodeToString(digest.Sum(nil))+`"`)
 	}
-	http.ServeContent(w, r, filename, time.Time{}, file)
-	if err := file.Close(); err != nil {
-		s.Log.Error("close package file", "repository", repo, "filename", filename, "error", err)
-	}
+	http.ServeContent(w, r, filename, fileInfo.ModTime(), file)
 }
 
 func (s *Server) apkConfiguration(w http.ResponseWriter, r *http.Request) {

@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,6 +144,60 @@ func TestAdminScopedKeysAndAutomaticIndexing(t *testing.T) {
 		_, err := os.Stat(indexPath)
 		return err == nil
 	})
+	indexURL := server.URL + "/os/x86_64/APKINDEX.tar.gz"
+	response = request(t, server.Client(), http.MethodGet, indexURL, "", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("index download status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	lastModified := response.Header.Get("Last-Modified")
+	if lastModified == "" {
+		t.Fatal("index response has no Last-Modified header")
+	}
+	etag := response.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("index response has no ETag")
+	}
+	closeResponseBody(t, response.Body)
+	headRequest, err := http.NewRequest(http.MethodHead, indexURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = server.Client().Do(headRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeResponseBody(t, response.Body)
+	if response.StatusCode != http.StatusOK || response.Header.Get("ETag") != etag {
+		t.Fatalf("index HEAD status/ETag = %d/%q, want %d/%q", response.StatusCode, response.Header.Get("ETag"), http.StatusOK, etag)
+	}
+
+	conditionalRequest, err := http.NewRequest(http.MethodGet, indexURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conditionalRequest.Header.Set("If-None-Match", etag)
+	response, err = server.Client().Do(conditionalRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeResponseBody(t, response.Body)
+	if response.StatusCode != http.StatusNotModified {
+		t.Fatalf("conditional index request status = %d, want %d", response.StatusCode, http.StatusNotModified)
+	}
+	conditionalRequest, err = http.NewRequest(http.MethodGet, indexURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conditionalRequest.Header.Set("If-Modified-Since", lastModified)
+	response, err = server.Client().Do(conditionalRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeResponseBody(t, response.Body)
+	if response.StatusCode != http.StatusNotModified {
+		t.Fatalf("conditional index request status = %d, want %d", response.StatusCode, http.StatusNotModified)
+	}
+
 	privateFile := filepath.Join(filepath.Dir(indexPath), ".internal-private")
 	if err := os.WriteFile(privateFile, body, 0600); err != nil {
 		t.Fatal(err)
@@ -223,6 +278,85 @@ func TestAdminScopedKeysAndAutomaticIndexing(t *testing.T) {
 	closeResponseBody(t, response.Body)
 	if _, err := keys.Authenticate(deployKey.Token); err == nil {
 		t.Fatal("revoked API key still authenticated")
+	}
+}
+
+func TestApkoCachesIndexUsingETag(t *testing.T) {
+	root := t.TempDir()
+	publicRead := true
+	cfg := config.Config{
+		StorageRoot: root, Repository: "os", PublicRead: &publicRead,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	manager, err := NewManager(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, _, err := manager.Read(context.Background(), "os", "x86_64/APKINDEX.tar.gz")
+	if err != nil {
+		t.Fatalf("create empty index: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var headRequests, getRequests atomic.Int64
+	routes := (&Server{Config: cfg, Manager: manager, Log: logger}).Routes()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/os/x86_64/APKINDEX.tar.gz" {
+			switch r.Method {
+			case http.MethodHead:
+				headRequests.Add(1)
+			case http.MethodGet:
+				getRequests.Add(1)
+			}
+		}
+		routes.ServeHTTP(w, r)
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	repositoryURL := server.URL + "/os"
+	getIndexes := func() {
+		t.Helper()
+		indexes, err := apkoapk.GetRepositoryIndexes(
+			context.Background(), []string{repositoryURL}, nil, "x86_64",
+			apkoapk.WithIgnoreSignatures(true),
+			apkoapk.WithHTTPClient(server.Client()),
+		)
+		if err != nil {
+			t.Fatalf("apko fetch repository index: %v", err)
+		}
+		if len(indexes) != 1 {
+			t.Fatalf("apko returned %d indexes, want 1", len(indexes))
+		}
+	}
+
+	getIndexes()
+	getIndexes()
+	if got := getRequests.Load(); got != 1 {
+		t.Fatalf("apko made %d index GET requests for an unchanged index, want 1", got)
+	}
+	if got := headRequests.Load(); got != 2 {
+		t.Fatalf("apko made %d index HEAD requests, want 2", got)
+	}
+
+	changedArchive, err := apkoapk.ArchiveFromIndex(&apkoapk.APKIndex{Description: "changed index"})
+	if err != nil {
+		t.Fatalf("create changed index archive: %v", err)
+	}
+	changedIndex, err := io.ReadAll(changedArchive)
+	if err != nil {
+		t.Fatalf("read changed index archive: %v", err)
+	}
+	indexPath := filepath.Join(root, "os", "x86_64", "APKINDEX.tar.gz")
+	if err := os.WriteFile(indexPath, changedIndex, 0644); err != nil {
+		t.Fatalf("replace index: %v", err)
+	}
+
+	getIndexes()
+	if got := getRequests.Load(); got != 2 {
+		t.Fatalf("apko made %d index GET requests after the index changed, want 2", got)
 	}
 }
 

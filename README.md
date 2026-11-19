@@ -173,7 +173,10 @@ The index is beside the packages at
 APK architectures supported by Melange: `x86`, `x86_64`, `aarch64`, `armhf`,
 `armv7`, `loongarch64`, `ppc64le`, `riscv64`, and `s390x`. Uploads to other
 architecture paths are rejected. There are no branch or component path
-segments.
+segments. Package and index downloads include `Last-Modified` and support
+conditional requests using `If-Modified-Since`. Index responses also include a
+content-based `ETag`, which lets apko-based clients reuse cached index data
+until the index changes.
 
 Upload a package with an API key:
 
@@ -314,5 +317,7 @@ run it locally, install the matching Melange (`v0.65.0`) and apko (`v1.4.15`)
 versions and ensure Docker is available, then run `make e2e`.
 
 The GoReleaser image build uses `Dockerfile.goreleaser` to package its
-prebuilt binaries. The regular `Dockerfile` remains available for local
+prebuilt binaries in a `scratch` image. It runs as UID/GID `10001`; ensure the
+storage volume is writable by that identity (Kubernetes `fsGroup: 10001` is
+suitable). The regular `Dockerfile` remains available for local
 `docker compose up --build` development.
