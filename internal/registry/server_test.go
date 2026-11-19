@@ -5,7 +5,12 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,17 +28,10 @@ import (
 
 func TestAdminScopedKeysAndAutomaticIndexing(t *testing.T) {
 	root := t.TempDir()
-	indexer := filepath.Join(t.TempDir(), "apk")
-	script := "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    shift\n    printf index > \"$1\"\n    exit 0\n  fi\n  shift\ndone\nexit 1\n"
-	if err := os.WriteFile(indexer, []byte(script), 0755); err != nil {
-		t.Fatal(err)
-	}
 	publicRead := true
 	cfg := config.Config{
 		StorageRoot:   root,
 		Repository:    "os",
-		IndexFormat:   "v2",
-		APKBinary:     indexer,
 		MaxUploadSize: 1 << 20,
 		AdminUsername: "admin",
 		AdminPassword: "a-long-test-password",
@@ -226,22 +224,39 @@ func TestAdminScopedKeysAndAutomaticIndexing(t *testing.T) {
 
 func TestIndexingDoesNotBlockConcurrentUploadsAndPublishesLatestSnapshot(t *testing.T) {
 	root := t.TempDir()
-	indexer := filepath.Join(t.TempDir(), "apk")
 	startedPath := filepath.Join(t.TempDir(), "index-started")
 	releasePath := filepath.Join(t.TempDir(), "release-index")
-	script := fmt.Sprintf("#!/bin/sh\nargs=\"$*\"\noutput=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    shift\n    output=\"$1\"\n  fi\n  shift\ndone\nif [ ! -e %q ]; then\n  : > %q\n  while [ ! -e %q ]; do sleep 0.01; done\nfi\nprintf '%%s\\\\n' \"$args\" > \"$output\"\n", startedPath, startedPath, releasePath)
-	if err := os.WriteFile(indexer, []byte(script), 0755); err != nil {
-		t.Fatal(err)
-	}
 	cfg := config.Config{
 		StorageRoot: root, Repository: "os",
-		IndexFormat: "v2", APKBinary: indexer, MaxUploadSize: 1 << 20,
+		MaxUploadSize: 1 << 20,
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	manager, err := NewManager(cfg, log)
 	if err != nil {
 		t.Fatal(err)
 	}
+	manager.indexer = indexerFunc(func(_ context.Context, packageDir, _, output, _ string) error {
+		if _, err := os.Stat(startedPath); os.IsNotExist(err) {
+			if err := os.WriteFile(startedPath, nil, 0600); err != nil {
+				return err
+			}
+			for {
+				if _, err := os.Stat(releasePath); err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		files, err := filepath.Glob(filepath.Join(packageDir, "*.apk"))
+		if err != nil {
+			return err
+		}
+		var entries strings.Builder
+		for _, file := range files {
+			fmt.Fprintln(&entries, filepath.Base(file))
+		}
+		return os.WriteFile(output, []byte(entries.String()), 0600)
+	})
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	manager.Start(workerCtx)
 	t.Cleanup(cancelWorker)
@@ -294,14 +309,9 @@ func TestIndexingDoesNotBlockConcurrentUploadsAndPublishesLatestSnapshot(t *test
 
 func TestV2NewPackageMergesIntoCurrentIndex(t *testing.T) {
 	root := t.TempDir()
-	indexer := filepath.Join(t.TempDir(), "apk")
-	script := "#!/bin/sh\nargs=\"$*\"\noutput=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--output\" ]; then\n    shift\n    output=\"$1\"\n  fi\n  shift\ndone\nprintf '%s\\n' \"$args\" > \"$output\"\n"
-	if err := os.WriteFile(indexer, []byte(script), 0755); err != nil {
-		t.Fatal(err)
-	}
 	cfg := config.Config{
 		StorageRoot: root, Repository: "os",
-		IndexFormat: "v2", APKBinary: indexer, MaxUploadSize: 1 << 20,
+		MaxUploadSize: 1 << 20,
 	}
 	manager, err := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -322,22 +332,255 @@ func TestV2NewPackageMergesIntoCurrentIndex(t *testing.T) {
 	indexPath := filepath.Join(root, "os", "x86_64", "APKINDEX.tar.gz")
 	upload("foo")
 	waitFor(t, "initial full index", func() bool {
-		index, err := os.ReadFile(indexPath)
-		return err == nil && !strings.Contains(string(index), "--merge") && strings.Contains(string(index), "foo-1.0-r0.apk")
+		index, err := readAPKIndex(indexPath)
+		return err == nil && strings.Contains(index, "P:foo\n") && strings.Contains(index, "V:1.0-r0\n")
 	})
 	upload("bar")
 	waitFor(t, "incremental index merge", func() bool {
-		index, err := os.ReadFile(indexPath)
+		index, err := readAPKIndex(indexPath)
 		return err == nil &&
-			strings.Contains(string(index), "--merge --index "+indexPath) &&
-			strings.Contains(string(index), "bar-1.0-r0.apk")
+			strings.Contains(index, "P:foo\n") &&
+			strings.Contains(index, "P:bar\n")
 	})
-	index, err := os.ReadFile(indexPath)
+	index, err := readAPKIndex(indexPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(index), "foo-1.0-r0.apk") {
-		t.Fatal("incremental merge unnecessarily included previously indexed package files")
+	if !strings.Contains(index, "P:foo\n") || !strings.Contains(index, "P:bar\n") {
+		t.Fatal("incremental index merge did not retain both package records")
+	}
+}
+
+func TestEmptyRepositoryIndexIsServedAndFirstPackageMerges(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Config{
+		StorageRoot: root, Repository: "os",
+		MaxUploadSize: 1 << 20,
+	}
+	manager, err := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go manager.runIndexWorker(ctx)
+	t.Cleanup(cancel)
+
+	indexPath := filepath.Join(root, "os", "x86_64", "APKINDEX.tar.gz")
+	file, name, err := manager.Read(ctx, "os", "x86_64/APKINDEX.tar.gz")
+	if err != nil {
+		t.Fatalf("read empty repository index: %v", err)
+	}
+	file.Close()
+	if name != "APKINDEX.tar.gz" {
+		t.Fatalf("index filename = %q, want APKINDEX.tar.gz", name)
+	}
+	index, err := readAPKIndex(indexPath)
+	if err != nil {
+		t.Fatalf("read generated empty index: %v", err)
+	}
+	if strings.TrimSpace(index) != "" {
+		t.Fatalf("new repository index contains package records: %q", index)
+	}
+
+	published, err := manager.buildAndPublishIndex(ctx, indexNamespace{arch: "x86_64"}, indexWork{full: true})
+	if err != nil || !published {
+		t.Fatalf("startup recovery of empty index = %v, %v; want published, nil", published, err)
+	}
+	if _, err := os.Stat(indexPath); err != nil {
+		t.Fatalf("startup recovery removed the empty index: %v", err)
+	}
+
+	_, err = manager.Upload(
+		ctx,
+		"os",
+		"x86_64/foo-1.0-r0.apk",
+		false,
+		bytes.NewReader(testAPK(t, "foo", "1.0-r0", "x86_64")),
+	)
+	if err != nil {
+		t.Fatalf("upload first package to empty repository: %v", err)
+	}
+	waitFor(t, "first package merge into empty index", func() bool {
+		index, err := readAPKIndex(indexPath)
+		return err == nil && strings.Contains(index, "P:foo\n")
+	})
+}
+
+func TestSigningKeyIsDiscoverableAndServedAtRepositoryRoot(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyPath := filepath.Join(t.TempDir(), "registry.rsa")
+	privatePEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	})
+	if err := os.WriteFile(privateKeyPath, privatePEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	publicRead := true
+	cfg := config.Config{
+		StorageRoot: t.TempDir(), Repository: "os", MaxUploadSize: 1 << 20,
+		PublicRead: &publicRead, PublicURL: "https://packages.example.com",
+		SigningKey: privateKeyPath,
+	}
+	manager, err := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer((&Server{Config: cfg, Manager: manager}).Routes())
+	defer server.Close()
+
+	response := request(t, server.Client(), http.MethodGet, server.URL+"/os/apk-configuration", "", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("apk-configuration status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	var discovery struct {
+		JWKSURI string `json:"jwks_uri"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&discovery); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if discovery.JWKSURI != "https://packages.example.com/os/jwks.json" {
+		t.Fatalf("jwks_uri = %q, want configured public URL", discovery.JWKSURI)
+	}
+
+	response = request(t, server.Client(), http.MethodGet, server.URL+"/os/jwks.json", "", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("JWKS status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	var jwks struct {
+		Keys []struct {
+			KeyType  string `json:"kty"`
+			KeyID    string `json:"kid"`
+			Modulus  string `json:"n"`
+			Exponent string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&jwks); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(jwks.Keys) != 1 || jwks.Keys[0].KeyType != "RSA" ||
+		jwks.Keys[0].KeyID != "registry" || jwks.Keys[0].Modulus == "" ||
+		jwks.Keys[0].Exponent != "AQAB" {
+		t.Fatalf("unexpected JWKS response: %+v", jwks)
+	}
+
+	response = request(t, server.Client(), http.MethodGet, server.URL+"/os/registry.rsa.pub", "", nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("public key status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	publicPEM, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicBlock, _ := pem.Decode(publicPEM)
+	if publicBlock == nil {
+		t.Fatal("served public key is not PEM encoded")
+	}
+	parsedPublic, err := x509.ParsePKIXPublicKey(publicBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servedKey, ok := parsedPublic.(*rsa.PublicKey)
+	if !ok || servedKey.N.Cmp(privateKey.N) != 0 {
+		t.Fatal("served public key does not match the configured private key")
+	}
+}
+
+func TestUploadRejectsUnsupportedArchitecture(t *testing.T) {
+	manager, err := NewManager(config.Config{
+		StorageRoot: t.TempDir(), Repository: "os", MaxUploadSize: 1 << 20,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = manager.Upload(
+		context.Background(),
+		"os",
+		"sparc64/package-1.0-r0.apk",
+		false,
+		bytes.NewReader(testAPK(t, "package", "1.0-r0", "sparc64")),
+	)
+	if !errors.Is(err, errUnsupportedArchitecture) {
+		t.Fatalf("upload error = %v, want unsupported architecture", err)
+	}
+}
+
+func TestUploadRejectsAPKMetadataThatApkoCannotIndex(t *testing.T) {
+	manager, err := NewManager(config.Config{
+		StorageRoot: t.TempDir(), Repository: "os", MaxUploadSize: 1 << 20,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info := []byte("pkgname = package\npkgver = 1.0-r0\narch = x86_64\npkgdesc = `first line\nsecond line`\n")
+	_, err = manager.Upload(
+		context.Background(),
+		"os",
+		"x86_64/package-1.0-r0.apk",
+		false,
+		bytes.NewReader(testAPKWithInfo(t, info)),
+	)
+	if !errors.Is(err, errInvalidAPK) {
+		t.Fatalf("upload error = %v, want invalid APK metadata", err)
+	}
+}
+
+func TestFailedAuthenticationIsLoggedWithoutCredentials(t *testing.T) {
+	var logOutput bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+	keys, err := authz.OpenTokenStore(filepath.Join(t.TempDir(), "api-keys.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		Authorizer: authz.New("admin", "expected-admin-password", keys),
+		Keys:       keys,
+		Log:        logger,
+	}
+
+	adminRequest := httptest.NewRequest(http.MethodGet, "/api/v1/admin/tokens", nil)
+	if server.requireAdmin(httptest.NewRecorder(), adminRequest) {
+		t.Fatal("missing admin credentials were accepted")
+	}
+	adminRequest = httptest.NewRequest(http.MethodGet, "/api/v1/admin/tokens", nil)
+	adminRequest.SetBasicAuth("admin", "do-not-log-admin-password")
+	if server.requireAdmin(httptest.NewRecorder(), adminRequest) {
+		t.Fatal("invalid admin credentials were accepted")
+	}
+
+	apiKeyRequest := httptest.NewRequest(http.MethodPut, "/os/x86_64/package.apk", nil)
+	apiKeyRequest.Header.Set("Authorization", "Bearer apk_do-not-log-api-key")
+	if _, ok := server.authenticate(httptest.NewRecorder(), apiKeyRequest); ok {
+		t.Fatal("invalid API key was accepted")
+	}
+
+	logs := logOutput.String()
+	for _, expected := range []string{
+		"authentication failed",
+		"auth_type=admin_basic",
+		"auth_type=api_key",
+		"reason=missing_or_malformed_credentials",
+		"reason=invalid_credentials",
+	} {
+		if !strings.Contains(logs, expected) {
+			t.Errorf("authentication logs do not contain %q: %s", expected, logs)
+		}
+	}
+	for _, secret := range []string{"do-not-log-admin-password", "apk_do-not-log-api-key"} {
+		if strings.Contains(logs, secret) {
+			t.Errorf("authentication logs exposed credential %q", secret)
+		}
 	}
 }
 
@@ -345,6 +588,38 @@ type createdKey struct {
 	ID        string     `json:"id"`
 	Token     string     `json:"token"`
 	ExpiresAt *time.Time `json:"expires_at"`
+}
+
+type indexerFunc func(context.Context, string, string, string, string) error
+
+func (f indexerFunc) BuildV2Merge(ctx context.Context, packageDir, existing, output, arch string) error {
+	return f(ctx, packageDir, existing, output, arch)
+}
+
+func readAPKIndex(filename string) (string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	gz, err := gzip.NewReader(file)
+	if err != nil {
+		return "", err
+	}
+	defer gz.Close()
+
+	tarReader := tar.NewReader(gz)
+	for {
+		header, err := tarReader.Next()
+		if err != nil {
+			return "", err
+		}
+		if header.Name == "APKINDEX" {
+			data, err := io.ReadAll(tarReader)
+			return string(data), err
+		}
+	}
 }
 
 func createKey(t *testing.T, client *http.Client, baseURL, name string, permissions []string) createdKey {
@@ -437,10 +712,14 @@ func requestAdmin(t *testing.T, client *http.Client, method, url string, body []
 
 func testAPK(t *testing.T, name, version, arch string) []byte {
 	t.Helper()
+	return testAPKWithInfo(t, []byte("pkgname = "+name+"\npkgver = "+version+"\narch = "+arch+"\n"))
+}
+
+func testAPKWithInfo(t *testing.T, info []byte) []byte {
+	t.Helper()
 	var buffer bytes.Buffer
 	compressed := gzip.NewWriter(&buffer)
 	archive := tar.NewWriter(compressed)
-	info := []byte("pkgname = " + name + "\npkgver = " + version + "\narch = " + arch + "\n")
 	if err := archive.WriteHeader(&tar.Header{Name: ".PKGINFO", Mode: 0644, Size: int64(len(info))}); err != nil {
 		t.Fatal(err)
 	}

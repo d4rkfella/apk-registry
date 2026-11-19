@@ -1,12 +1,15 @@
 package registry
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -34,6 +37,13 @@ type createAPIKeyResponse struct {
 	Token string `json:"token"`
 }
 
+type rsaJWK struct {
+	KeyType  string `json:"kty"`
+	KeyID    string `json:"kid"`
+	Modulus  string `json:"n"`
+	Exponent string `json:"e"`
+}
+
 func (s *Server) Routes() http.Handler {
 	if s.Log == nil {
 		s.Log = slog.Default()
@@ -45,6 +55,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/tokens", s.listAPIKeys)
 	mux.HandleFunc("POST /api/v1/admin/tokens", s.createAPIKey)
 	mux.HandleFunc("DELETE /api/v1/admin/tokens/{id}", s.revokeAPIKey)
+	mux.HandleFunc("GET /{repo}/apk-configuration", s.apkConfiguration)
+	mux.HandleFunc("GET /{repo}/jwks.json", s.jwks)
+	mux.HandleFunc("GET /{repo}/{filename}", s.readSigningPublicKey)
 	mux.HandleFunc("GET /{repo}/{path...}", s.readPackage)
 	mux.HandleFunc("PUT /{repo}/{path...}", s.uploadPackage)
 	mux.HandleFunc("DELETE /{repo}/{path...}", s.deletePackage)
@@ -110,6 +123,17 @@ func (s *Server) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
 func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 	username, password, ok := r.BasicAuth()
 	if !ok || !s.Authorizer.AuthenticateAdmin(username, password) {
+		reason := "invalid_credentials"
+		if !ok {
+			reason = "missing_or_malformed_credentials"
+		}
+		s.Log.Warn("authentication failed",
+			"auth_type", "admin_basic",
+			"reason", reason,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"remote_addr", r.RemoteAddr,
+		)
 		w.Header().Set("WWW-Authenticate", `Basic realm="apk-registry-admin", charset="UTF-8"`)
 		http.Error(w, "administrator credentials required", http.StatusUnauthorized)
 		return false
@@ -119,18 +143,8 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 
 func (s *Server) readPackage(w http.ResponseWriter, r *http.Request) {
 	repo, relative := r.PathValue("repo"), r.PathValue("path")
-	if !s.requireConfiguredRepository(w, r, repo) {
+	if !s.requireReadAccess(w, r, repo) {
 		return
-	}
-	if !*s.Config.PublicRead {
-		identity, ok := s.authenticate(w, r)
-		if !ok {
-			return
-		}
-		if !s.Authorizer.Authorize(identity, "read") {
-			http.Error(w, "read permission denied", http.StatusForbidden)
-			return
-		}
 	}
 	file, filename, err := s.Manager.Read(r.Context(), repo, relative)
 	if err != nil {
@@ -149,10 +163,85 @@ func (s *Server) readPackage(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/vnd.alpine.apk")
 	case filename == "APKINDEX.tar.gz":
 		w.Header().Set("Content-Type", "application/gzip")
-	case filename == "Packages.adb":
-		w.Header().Set("Content-Type", "application/octet-stream")
 	}
 	http.ServeContent(w, r, filename, time.Time{}, file)
+}
+
+func (s *Server) apkConfiguration(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("repo")
+	if !s.requireReadAccess(w, r, repo) {
+		return
+	}
+	if s.Manager.signingKey == nil {
+		http.NotFound(w, r)
+		return
+	}
+	jsonResponse(w, http.StatusOK, struct {
+		JWKSURI string `json:"jwks_uri"`
+	}{JWKSURI: s.publicRepositoryURL(r, repo) + "/jwks.json"})
+}
+
+func (s *Server) jwks(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("repo")
+	if !s.requireReadAccess(w, r, repo) {
+		return
+	}
+	if s.Manager.signingKey == nil {
+		http.NotFound(w, r)
+		return
+	}
+	key := s.Manager.signingKey
+	jsonResponse(w, http.StatusOK, struct {
+		Keys []rsaJWK `json:"keys"`
+	}{Keys: []rsaJWK{{
+		KeyType:  "RSA",
+		KeyID:    key.id,
+		Modulus:  base64.RawURLEncoding.EncodeToString(key.publicKey.N.Bytes()),
+		Exponent: base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.publicKey.E)).Bytes()),
+	}}})
+}
+
+func (s *Server) readSigningPublicKey(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("repo")
+	if !s.requireReadAccess(w, r, repo) {
+		return
+	}
+	if s.Manager.signingKey == nil || r.PathValue("filename") != s.Manager.signingKey.publicName {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	http.ServeContent(w, r, s.Manager.signingKey.publicName, time.Time{}, bytes.NewReader(s.Manager.signingKey.publicKeyPEM))
+}
+
+func (s *Server) publicRepositoryURL(r *http.Request, repo string) string {
+	if s.Config.PublicURL != "" {
+		return strings.TrimRight(s.Config.PublicURL, "/") + "/" + repo
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	} else if forwardedProto := strings.ToLower(strings.TrimSpace(strings.SplitN(r.Header.Get("X-Forwarded-Proto"), ",", 2)[0])); forwardedProto == "http" || forwardedProto == "https" {
+		scheme = forwardedProto
+	}
+	return (&url.URL{Scheme: scheme, Host: r.Host, Path: "/" + repo}).String()
+}
+
+func (s *Server) requireReadAccess(w http.ResponseWriter, r *http.Request, repo string) bool {
+	if !s.requireConfiguredRepository(w, r, repo) {
+		return false
+	}
+	if !*s.Config.PublicRead {
+		identity, ok := s.authenticate(w, r)
+		if !ok {
+			return false
+		}
+		if !s.Authorizer.Authorize(identity, "read") {
+			http.Error(w, "read permission denied", http.StatusForbidden)
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) uploadPackage(w http.ResponseWriter, r *http.Request) {
@@ -199,12 +288,26 @@ func (s *Server) deletePackage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*authz.Identity, bool) {
 	raw, err := bearer(r)
 	if err != nil {
+		s.Log.Warn("authentication failed",
+			"auth_type", "api_key",
+			"reason", "missing_or_malformed_credentials",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"remote_addr", r.RemoteAddr,
+		)
 		w.Header().Set("WWW-Authenticate", `Basic realm="apk-registry", charset="UTF-8"`)
 		http.Error(w, "authentication required", http.StatusUnauthorized)
 		return nil, false
 	}
 	identity, err := s.Authorizer.Authenticate(raw)
 	if err != nil {
+		s.Log.Warn("authentication failed",
+			"auth_type", "api_key",
+			"reason", "invalid_credentials",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"remote_addr", r.RemoteAddr,
+		)
 		w.Header().Set("WWW-Authenticate", `Basic realm="apk-registry", charset="UTF-8"`)
 		http.Error(w, "invalid credential", http.StatusUnauthorized)
 		return nil, false
@@ -244,6 +347,8 @@ func (s *Server) writeManagerError(w http.ResponseWriter, r *http.Request, err e
 	switch {
 	case errors.Is(err, errOverwriteDenied):
 		http.Error(w, err.Error(), http.StatusForbidden)
+	case errors.Is(err, errUnsupportedArchitecture):
+		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, errPackageTooLarge):
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 	case errors.Is(err, errInvalidPackagePath):

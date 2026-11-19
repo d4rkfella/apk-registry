@@ -5,7 +5,7 @@ COPY . .
 RUN mkdir -p /out && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/apk-registry ./cmd/server
 
 FROM alpine:3.24
-RUN apk add --no-cache apk-tools ca-certificates su-exec
+RUN apk add --no-cache ca-certificates su-exec
 RUN addgroup -S -g 10001 registry && adduser -S -D -H -u 10001 -G registry registry
 COPY --from=build /out/apk-registry /usr/local/bin/apk-registry
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint

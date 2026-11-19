@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	apkoapk "chainguard.dev/apko/pkg/apk/apk"
 	"github.com/d4rkfella/apk-registry/internal/apk"
 	"github.com/d4rkfella/apk-registry/internal/config"
 	"github.com/d4rkfella/apk-registry/internal/repository"
@@ -21,16 +22,22 @@ import (
 
 var errOverwriteDenied = errors.New("delete permission is required to overwrite an existing package")
 var errInvalidPackagePath = errors.New("package path is invalid")
+var errUnsupportedArchitecture = errors.New("unsupported package architecture")
 var errPackageTooLarge = errors.New("package exceeds maximum upload size")
 var errInvalidAPK = errors.New("invalid APK")
 
+type indexBuilder interface {
+	BuildV2Merge(context.Context, string, string, string, string) error
+}
+
 type Manager struct {
-	root      string
-	repo      string
-	indexName string
-	indexer   apk.Indexer
-	maxUpload int64
-	log       *slog.Logger
+	root       string
+	repo       string
+	indexName  string
+	indexer    indexBuilder
+	maxUpload  int64
+	log        *slog.Logger
+	signingKey *signingKeyInfo
 
 	stateMu   sync.Mutex
 	states    map[indexNamespace]*namespaceState
@@ -55,6 +62,14 @@ func NewManager(cfg config.Config, log *slog.Logger) (*Manager, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	var signingKey *signingKeyInfo
+	if cfg.SigningKey != "" {
+		var err error
+		signingKey, err = loadSigningKey(cfg.SigningKey)
+		if err != nil {
+			return nil, fmt.Errorf("load APK index signing key: %w", err)
+		}
+	}
 	root, err := filepath.Abs(cfg.StorageRoot)
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage root: %w", err)
@@ -66,21 +81,18 @@ func NewManager(cfg config.Config, log *slog.Logger) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage root symlinks: %w", err)
 	}
-	indexName := "APKINDEX.tar.gz"
-	if cfg.IndexFormat == "v3" {
-		indexName = "Packages.adb"
-	}
 	return &Manager{
-		root:      root,
-		repo:      cfg.Repository,
-		indexName: indexName,
-		indexer:   apk.Indexer{APKBinary: cfg.APKBinary, SigningKey: cfg.SigningKey},
-		maxUpload: cfg.MaxUploadSize,
-		log:       log,
-		states:    make(map[indexNamespace]*namespaceState),
-		pending:   make(map[indexNamespace]indexWork),
-		retrying:  make(map[indexNamespace]indexRetry),
-		wake:      make(chan struct{}, 1),
+		root:       root,
+		repo:       cfg.Repository,
+		indexName:  "APKINDEX.tar.gz",
+		indexer:    apk.Indexer{SigningKey: cfg.SigningKey},
+		maxUpload:  cfg.MaxUploadSize,
+		log:        log,
+		signingKey: signingKey,
+		states:     make(map[indexNamespace]*namespaceState),
+		pending:    make(map[indexNamespace]indexWork),
+		retrying:   make(map[indexNamespace]indexRetry),
+		wake:       make(chan struct{}, 1),
 	}, nil
 }
 
@@ -100,8 +112,8 @@ func (m *Manager) Read(ctx context.Context, repo, relative string) (*os.File, st
 		return nil, "", os.ErrNotExist
 	}
 	_, _, isPackage := repository.ParsePackagePath(relative)
+	arch, isIndex := repository.ParseIndexPath(relative, m.indexName)
 	if !isPackage {
-		_, isIndex := repository.ParseIndexPath(relative, m.indexName)
 		if !isIndex {
 			return nil, "", errInvalidPackagePath
 		}
@@ -109,6 +121,15 @@ func (m *Manager) Read(ctx context.Context, repo, relative string) (*os.File, st
 	key := repo + "/" + relative
 	filename := path.Base(relative)
 	file, err := m.openFile(key)
+	if errors.Is(err, os.ErrNotExist) && isIndex {
+		if err := m.ensureEmptyIndex(ctx, repo, relative, arch); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				m.log.Error("generate empty package index", "repository", repo, "architecture", arch, "error", err)
+			}
+			return nil, "", err
+		}
+		file, err = m.openFile(key)
+	}
 	if err != nil {
 		return nil, "", err
 	}
@@ -119,6 +140,65 @@ func (m *Manager) Read(ctx context.Context, repo, relative string) (*os.File, st
 	return file, filename, nil
 }
 
+func (m *Manager) ensureEmptyIndex(ctx context.Context, repo, relative, arch string) error {
+	if !repository.SupportedArchitecture(arch) {
+		return os.ErrNotExist
+	}
+	indexPath, err := m.pathFor(path.Join(repo, relative), true)
+	if err != nil {
+		return err
+	}
+	packageDir := filepath.Dir(indexPath)
+	state := m.namespaceState(indexNamespace{arch: arch})
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if info, err := os.Lstat(indexPath); err == nil {
+		if info.Mode().IsRegular() {
+			return nil
+		}
+		return errors.New("index target is not a regular file")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	entries, err := os.ReadDir(packageDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".apk") {
+			return os.ErrNotExist
+		}
+	}
+
+	outputFile, err := os.CreateTemp(packageDir, ".index-output-*")
+	if err != nil {
+		return err
+	}
+	outputPath := outputFile.Name()
+	if err := outputFile.Close(); err != nil {
+		os.Remove(outputPath)
+		return err
+	}
+	if err := os.Remove(outputPath); err != nil {
+		return err
+	}
+	defer os.Remove(outputPath)
+	defer os.Remove(outputPath + ".tmp")
+
+	if err := m.indexer.BuildV2Merge(ctx, packageDir, "", outputPath, arch); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return os.Rename(outputPath, indexPath)
+}
+
 func (m *Manager) Upload(ctx context.Context, repo, relative string, allowOverwrite bool, body io.Reader) (Package, error) {
 	if repo != m.repo || !repository.ValidSegment(repo) {
 		return Package{}, errInvalidPackagePath
@@ -126,6 +206,9 @@ func (m *Manager) Upload(ctx context.Context, repo, relative string, allowOverwr
 	arch, filename, ok := repository.ParsePackagePath(relative)
 	if !ok {
 		return Package{}, errInvalidPackagePath
+	}
+	if !repository.SupportedArchitecture(arch) {
+		return Package{}, fmt.Errorf("%w: %q", errUnsupportedArchitecture, arch)
 	}
 	ns := indexNamespace{arch: arch}
 	packageKey := path.Join(arch, filename)
@@ -188,7 +271,7 @@ func (m *Manager) Upload(ctx context.Context, repo, relative string, allowOverwr
 	if err != nil {
 		return Package{}, err
 	}
-	metadata, metaErr := repository.ParseAPKMetadata(file)
+	apkPackage, metaErr := apkoapk.ParsePackage(ctx, file, uint64(size))
 	closeErr := file.Close()
 	if metaErr != nil {
 		return Package{}, fmt.Errorf("%w: %v", errInvalidAPK, metaErr)
@@ -196,8 +279,9 @@ func (m *Manager) Upload(ctx context.Context, repo, relative string, allowOverwr
 	if closeErr != nil {
 		return Package{}, closeErr
 	}
-	if metadata.Arch != arch {
-		return Package{}, fmt.Errorf("%w: architecture %q does not match path architecture %q", errInvalidAPK, metadata.Arch, arch)
+	metadata := repository.APKMetadata{Name: apkPackage.Name, Version: apkPackage.Version, Arch: apkPackage.Arch}
+	if apkPackage.Arch != arch {
+		return Package{}, fmt.Errorf("%w: architecture %q does not match path architecture %q", errInvalidAPK, apkPackage.Arch, arch)
 	}
 	if !repository.FilenameMatchesAPKMetadata(filename, metadata) {
 		return Package{}, fmt.Errorf("%w: metadata %s-%s does not match filename %s", errInvalidAPK, metadata.Name, metadata.Version, filename)
@@ -328,4 +412,17 @@ func (m *Manager) pathFor(key string, createDirs bool) (string, error) {
 		}
 	}
 	return current, nil
+}
+
+func isEmptyAPKIndex(filename string) (bool, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	index, err := apkoapk.IndexFromArchive(file)
+	if err != nil {
+		return false, err
+	}
+	return len(index.Packages) == 0, nil
 }

@@ -217,7 +217,7 @@ func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, w
 		return false, err
 	}
 
-	fullRebuild := work.full || m.indexName == "Packages.adb"
+	fullRebuild := work.full
 	if !fullRebuild {
 		info, err := os.Lstat(indexPath)
 		if errors.Is(err, os.ErrNotExist) {
@@ -291,6 +291,9 @@ func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, w
 		if state.version != version {
 			return false, nil
 		}
+		if empty, err := isEmptyAPKIndex(indexPath); err == nil && empty {
+			return true, nil
+		}
 		err := os.Remove(indexPath)
 		if errors.Is(err, os.ErrNotExist) {
 			return true, nil
@@ -313,9 +316,7 @@ func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, w
 	defer os.Remove(outputPath)
 	defer os.Remove(outputPath + ".tmp")
 
-	if m.indexName == "Packages.adb" {
-		err = m.indexer.BuildV3(ctx, snapshotDir, outputPath, ns.arch)
-	} else if fullRebuild {
+	if fullRebuild {
 		err = m.indexer.BuildV2Merge(ctx, snapshotDir, "", outputPath, ns.arch)
 	} else {
 		err = m.indexer.BuildV2Merge(ctx, snapshotDir, indexPath, outputPath, ns.arch)

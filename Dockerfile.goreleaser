@@ -1,6 +1,6 @@
 FROM alpine:3.24
 
-RUN apk add --no-cache apk-tools ca-certificates su-exec \
+RUN apk add --no-cache ca-certificates su-exec \
     && addgroup -S -g 10001 registry \
     && adduser -S -D -H -u 10001 -G registry registry \
     && mkdir -p /var/lib/apk-registry \

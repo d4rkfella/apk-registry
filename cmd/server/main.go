@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"time"
 
 	"github.com/d4rkfella/apk-registry/internal/authz"
@@ -45,17 +44,9 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	log.Info("starting", "listen", cfg.ListenAddr, "storage", cfg.StorageRoot, "apk", apkVersion(cfg.APKBinary))
+	log.Info("starting", "listen", cfg.ListenAddr, "storage", cfg.StorageRoot)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error("server", "error", err)
 		os.Exit(1)
 	}
-}
-
-func apkVersion(bin string) string {
-	out, err := exec.Command(bin, "--version").Output()
-	if err != nil {
-		return "unavailable"
-	}
-	return string(out)
 }

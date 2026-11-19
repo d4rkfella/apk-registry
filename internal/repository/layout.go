@@ -3,13 +3,29 @@ package repository
 import (
 	"regexp"
 	"strings"
+
+	"chainguard.dev/apko/pkg/build/types"
 )
 
 var filenameRE = regexp.MustCompile(`^[A-Za-z0-9._+~-]+\.apk$`)
 var segmentRE = regexp.MustCompile(`^[A-Za-z0-9._+~-]+$`)
+var melangeArchitectures = supportedMelangeArchitectures()
 
 func ValidSegment(segment string) bool {
 	return segment != "." && segment != ".." && segmentRE.MatchString(segment)
+}
+
+func SupportedArchitecture(arch string) bool {
+	_, ok := melangeArchitectures[arch]
+	return ok
+}
+
+func supportedMelangeArchitectures() map[string]struct{} {
+	architectures := make(map[string]struct{}, len(types.AllArchs))
+	for _, arch := range types.AllArchs {
+		architectures[arch.ToAPK()] = struct{}{}
+	}
+	return architectures
 }
 
 func ParsePackagePath(relative string) (arch, filename string, ok bool) {

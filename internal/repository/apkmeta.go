@@ -1,12 +1,6 @@
 package repository
 
-import (
-	"archive/tar"
-	"compress/gzip"
-	"fmt"
-	"io"
-	"strings"
-)
+import "strings"
 
 type APKMetadata struct{ Name, Version, Arch string }
 
@@ -19,48 +13,4 @@ func FilenameMatchesAPKMetadata(filename string, metadata APKMetadata) bool {
 		}
 	}
 	return base == metadata.Name && metadata.Version == "unknown"
-}
-
-func ParseAPKMetadata(r io.Reader) (APKMetadata, error) {
-	gz, err := gzip.NewReader(r)
-	if err != nil {
-		return APKMetadata{}, fmt.Errorf("invalid apk gzip: %w", err)
-	}
-	defer gz.Close()
-	tr := tar.NewReader(gz)
-	var out APKMetadata
-	for {
-		h, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return out, fmt.Errorf("invalid apk tar: %w", err)
-		}
-		if h.Name == ".PKGINFO" || strings.HasSuffix(h.Name, "/.PKGINFO") {
-			b, err := io.ReadAll(io.LimitReader(tr, 1<<20))
-			if err != nil {
-				return out, err
-			}
-			for _, line := range strings.Split(string(b), "\n") {
-				k, v, ok := strings.Cut(line, " = ")
-				if !ok {
-					continue
-				}
-				switch k {
-				case "pkgname":
-					out.Name = v
-				case "pkgver":
-					out.Version = v
-				case "arch":
-					out.Arch = v
-				}
-			}
-			break
-		}
-	}
-	if out.Name == "" || out.Version == "" || out.Arch == "" {
-		return APKMetadata{}, fmt.Errorf("APK .PKGINFO is missing pkgname/pkgver/arch")
-	}
-	return out, nil
 }

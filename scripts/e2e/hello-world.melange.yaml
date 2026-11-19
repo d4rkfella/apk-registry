@@ -1,0 +1,24 @@
+package:
+  name: hello-world
+  version: 1.0.0
+  epoch: 0
+  description: Hello world package for the registry end-to-end test
+  copyright:
+    - license: MIT
+  target-architecture:
+    - x86_64
+
+environment:
+  contents:
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    repositories:
+      - https://packages.wolfi.dev/os
+    packages:
+      - busybox
+
+pipeline:
+  - name: Create hello-world file
+    runs: |
+      mkdir -p "${{targets.destdir}}/usr/share/hello-world"
+      printf '%s\n' 'hello from apk-registry' > "${{targets.destdir}}/usr/share/hello-world/message"

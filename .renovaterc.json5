@@ -1,0 +1,14 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "dependencyDashboard": {
+    "enabled": true
+  },
+  "enabledManagers": [
+    "gomod",
+    "github-actions"
+  ]
+}

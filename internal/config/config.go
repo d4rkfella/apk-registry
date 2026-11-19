@@ -3,7 +3,9 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -15,8 +17,7 @@ type Config struct {
 	StorageRoot   string
 	Repository    string
 	PublicRead    *bool
-	IndexFormat   string
-	APKBinary     string
+	PublicURL     string
 	SigningKey    string
 	MaxUploadSize int64
 	AdminUsername string
@@ -28,18 +29,18 @@ func Load() (Config, error) {
 		ListenAddr:    ":8080",
 		StorageRoot:   "./data",
 		Repository:    "os",
-		IndexFormat:   "v2",
-		APKBinary:     "apk",
 		MaxUploadSize: 1 << 30,
 	}
 	cfg.ListenAddr = env("LISTEN_ADDR", cfg.ListenAddr)
 	cfg.StorageRoot = env("STORAGE_ROOT", cfg.StorageRoot)
 	cfg.Repository = env("REGISTRY_REPOSITORY", cfg.Repository)
-	cfg.IndexFormat = env("APK_INDEX_FORMAT", cfg.IndexFormat)
-	cfg.APKBinary = env("APK_BINARY", cfg.APKBinary)
+	cfg.PublicURL = os.Getenv("REGISTRY_PUBLIC_URL")
 	cfg.SigningKey = os.Getenv("APK_INDEX_SIGNING_KEY")
 	cfg.AdminUsername = os.Getenv("REGISTRY_ADMIN_USERNAME")
 	cfg.AdminPassword = os.Getenv("REGISTRY_ADMIN_PASSWORD")
+	if format := os.Getenv("APK_INDEX_FORMAT"); format != "" && format != "v2" {
+		return Config{}, fmt.Errorf("APK_INDEX_FORMAT=%q is unsupported; the registry always serves APKINDEX.tar.gz", format)
+	}
 	if raw := os.Getenv("MAX_UPLOAD_SIZE"); raw != "" {
 		size, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
@@ -65,8 +66,8 @@ func Load() (Config, error) {
 }
 
 func (c Config) Validate() error {
-	if c.ListenAddr == "" || c.StorageRoot == "" || c.Repository == "" || c.APKBinary == "" {
-		return errors.New("listen_addr, storage_root, repository, and apk_binary are required")
+	if c.ListenAddr == "" || c.StorageRoot == "" || c.Repository == "" {
+		return errors.New("listen_addr, storage_root, and repository are required")
 	}
 	if c.AdminUsername == "" || len(c.AdminUsername) > 128 || strings.ContainsAny(c.AdminUsername, ":\r\n") {
 		return errors.New("REGISTRY_ADMIN_USERNAME must be 1-128 characters and cannot contain colons or newlines")
@@ -80,8 +81,17 @@ func (c Config) Validate() error {
 	if !repository.ValidSegment(c.Repository) {
 		return errors.New("repository must be a valid path segment")
 	}
-	if c.IndexFormat != "v2" && c.IndexFormat != "v3" {
-		return fmt.Errorf("unsupported index_format %q", c.IndexFormat)
+	if c.PublicURL != "" {
+		publicURL, err := url.Parse(c.PublicURL)
+		if err != nil || (publicURL.Scheme != "http" && publicURL.Scheme != "https") ||
+			publicURL.Host == "" || publicURL.User != nil ||
+			(publicURL.Path != "" && publicURL.Path != "/") ||
+			publicURL.RawQuery != "" || publicURL.Fragment != "" {
+			return errors.New("REGISTRY_PUBLIC_URL must be an HTTP(S) origin without credentials, path, query, or fragment")
+		}
+	}
+	if c.SigningKey != "" && !strings.HasSuffix(filepath.Base(c.SigningKey), ".rsa") {
+		return errors.New("APK_INDEX_SIGNING_KEY must name a PEM RSA key ending in .rsa")
 	}
 	return nil
 }
