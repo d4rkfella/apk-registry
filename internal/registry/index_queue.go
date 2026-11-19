@@ -354,18 +354,23 @@ func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, w
 			return true, nil
 		}
 		state.mu.RLock()
-		defer state.mu.RUnlock()
 		if state.version != version {
+			state.mu.RUnlock()
 			return false, nil
 		}
-		if empty, err := isEmptyAPKIndex(indexPath); err == nil && empty {
-			return true, nil
+		if m.signingKey == nil {
+			if empty, err := isEmptyAPKIndex(indexPath); err == nil && empty {
+				state.mu.RUnlock()
+				return true, nil
+			}
+			state.mu.RUnlock()
+			err := os.Remove(indexPath)
+			if errors.Is(err, os.ErrNotExist) {
+				return true, nil
+			}
+			return true, err
 		}
-		err := os.Remove(indexPath)
-		if errors.Is(err, os.ErrNotExist) {
-			return true, nil
-		}
-		return true, err
+		state.mu.RUnlock()
 	}
 
 	outputFile, err := os.CreateTemp(filepath.Dir(indexPath), ".index-output-*")

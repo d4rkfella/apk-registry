@@ -468,6 +468,66 @@ func TestEmptyRepositoryIndexIsServedAndFirstPackageMerges(t *testing.T) {
 	})
 }
 
+func TestStartupRecoverySignsExistingEmptyIndex(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Config{
+		StorageRoot: root, Repository: "os",
+		MaxUploadSize: 1 << 20,
+	}
+	unsignedManager, err := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	indexPath := filepath.Join(root, "os", "x86_64", "APKINDEX.tar.gz")
+	file, _, err := unsignedManager.Read(ctx, "os", "x86_64/APKINDEX.tar.gz")
+	if err != nil {
+		t.Fatalf("create existing empty index: %v", err)
+	}
+	file.Close()
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKeyPath := filepath.Join(t.TempDir(), "registry.rsa")
+	privatePEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	})
+	if err := os.WriteFile(privateKeyPath, privatePEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.SigningKey = privateKeyPath
+	signedManager, err := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	published, err := signedManager.buildAndPublishIndex(ctx, indexNamespace{arch: "x86_64"}, indexWork{full: true})
+	if err != nil || !published {
+		t.Fatalf("startup recovery of empty index = %v, %v; want published, nil", published, err)
+	}
+	indexFile, err := os.Open(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, indexErr := apkoapk.IndexFromArchive(indexFile)
+	closeErr := indexFile.Close()
+	if indexErr != nil {
+		t.Fatalf("read signed empty APKINDEX: %v", indexErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if len(index.Packages) != 0 {
+		t.Fatalf("recovered empty index contains %d packages, want 0", len(index.Packages))
+	}
+	if len(index.Signature) == 0 {
+		t.Fatal("startup recovery did not sign the existing empty index")
+	}
+}
+
 func TestSigningKeyIsDiscoverableAndServedAtRepositoryRoot(t *testing.T) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
