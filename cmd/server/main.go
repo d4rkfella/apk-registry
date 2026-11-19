@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -21,11 +22,17 @@ import (
 const serverShutdownTimeout = 20 * time.Second
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := newJSONLogger(os.Stdout)
 	if err := run(log); err != nil {
 		log.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func newJSONLogger(output io.Writer) *slog.Logger {
+	logger := slog.New(slog.NewJSONHandler(output, nil))
+	slog.SetDefault(logger)
+	return logger
 }
 
 func run(log *slog.Logger) error {
