@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -232,13 +233,31 @@ func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, w
 	state := m.namespaceState(ns)
 	state.mu.RLock()
 	version := state.version
-	entries, err := os.ReadDir(packageDir)
-	if errors.Is(err, os.ErrNotExist) {
-		entries, err = nil, nil
-	}
-	if err != nil {
-		state.mu.RUnlock()
-		return false, err
+	var packageNames []string
+	if fullRebuild {
+		entries, err := os.ReadDir(packageDir)
+		if errors.Is(err, os.ErrNotExist) {
+			entries, err = nil, nil
+		}
+		if err != nil {
+			state.mu.RUnlock()
+			return false, err
+		}
+		for _, entry := range entries {
+			if strings.HasSuffix(entry.Name(), ".apk") {
+				packageNames = append(packageNames, entry.Name())
+			}
+		}
+	} else {
+		packageNames = make([]string, 0, len(work.additions))
+		for filename := range work.additions {
+			if path.Base(filename) != filename || !repository.ValidSegment(filename) || !strings.HasSuffix(filename, ".apk") {
+				state.mu.RUnlock()
+				return false, fmt.Errorf("invalid package filename %q in index work", filename)
+			}
+			packageNames = append(packageNames, filename)
+		}
+		sort.Strings(packageNames)
 	}
 	snapshotRoot, err := os.MkdirTemp(packageDir, ".index-snapshot-*")
 	if err != nil {
@@ -252,16 +271,12 @@ func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, w
 		return false, err
 	}
 	packageCount := 0
-	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), ".apk") {
+	for _, filename := range packageNames {
+		source := filepath.Join(packageDir, filename)
+		info, err := os.Lstat(source)
+		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		if !fullRebuild {
-			if _, requested := work.additions[entry.Name()]; !requested {
-				continue
-			}
-		}
-		info, err := entry.Info()
 		if err != nil {
 			state.mu.RUnlock()
 			os.RemoveAll(snapshotRoot)
@@ -270,12 +285,11 @@ func (m *Manager) buildAndPublishIndex(ctx context.Context, ns indexNamespace, w
 		if !info.Mode().IsRegular() {
 			continue
 		}
-		source := filepath.Join(packageDir, entry.Name())
-		snapshot := filepath.Join(snapshotDir, entry.Name())
+		snapshot := filepath.Join(snapshotDir, filename)
 		if err := os.Link(source, snapshot); err != nil {
 			state.mu.RUnlock()
 			os.RemoveAll(snapshotRoot)
-			return false, fmt.Errorf("snapshot package %s: %w", entry.Name(), err)
+			return false, fmt.Errorf("snapshot package %s: %w", filename, err)
 		}
 		packageCount++
 	}
