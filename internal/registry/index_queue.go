@@ -27,12 +27,15 @@ type namespaceState struct {
 type indexWork struct {
 	full      bool
 	additions map[string]struct{}
+	readyAt   time.Time
 }
 
 type indexRetry struct {
 	id   uint64
 	work indexWork
 }
+
+const indexBatchWindow = 100 * time.Millisecond
 
 func (m *Manager) namespaceState(ns indexNamespace) *namespaceState {
 	m.stateMu.Lock()
@@ -50,13 +53,33 @@ func (m *Manager) enqueueIndex(ns indexNamespace) {
 }
 
 func (m *Manager) enqueueAddition(ns indexNamespace, filename string) {
-	m.enqueueWork(ns, indexWork{additions: map[string]struct{}{filename: {}}})
+	m.queueMu.Lock()
+	work, exists := m.pending[ns]
+	if !exists {
+		work.readyAt = time.Now().Add(indexBatchWindow)
+	}
+	if !work.full {
+		if work.additions == nil {
+			work.additions = make(map[string]struct{})
+		}
+		work.additions[filename] = struct{}{}
+	}
+	m.pending[ns] = work
+	m.queueMu.Unlock()
+	m.signalIndexWorker()
 }
 
 func (m *Manager) enqueueWork(ns indexNamespace, work indexWork) {
 	m.queueMu.Lock()
+	if _, exists := m.pending[ns]; !exists {
+		work.readyAt = time.Now().Add(indexBatchWindow)
+	}
 	m.pending[ns] = mergeIndexWork(m.pending[ns], work)
 	m.queueMu.Unlock()
+	m.signalIndexWorker()
+}
+
+func (m *Manager) signalIndexWorker() {
 	select {
 	case m.wake <- struct{}{}:
 	default:
@@ -64,28 +87,46 @@ func (m *Manager) enqueueWork(ns indexNamespace, work indexWork) {
 }
 
 func mergeIndexWork(first, second indexWork) indexWork {
+	readyAt := first.readyAt
+	if readyAt.IsZero() || (!second.readyAt.IsZero() && second.readyAt.Before(readyAt)) {
+		readyAt = second.readyAt
+	}
 	if first.full || second.full {
-		return indexWork{full: true}
+		return indexWork{full: true, readyAt: readyAt}
 	}
-	if len(first.additions)+len(second.additions) == 0 {
-		return indexWork{}
+	if len(second.additions) == 0 {
+		first.readyAt = readyAt
+		return first
 	}
-	merged := indexWork{additions: make(map[string]struct{}, len(first.additions)+len(second.additions))}
-	for filename := range first.additions {
-		merged.additions[filename] = struct{}{}
+	if first.additions == nil {
+		first.additions = make(map[string]struct{}, len(second.additions))
 	}
 	for filename := range second.additions {
-		merged.additions[filename] = struct{}{}
+		first.additions[filename] = struct{}{}
 	}
-	return merged
+	first.readyAt = readyAt
+	return first
 }
 
-func (m *Manager) nextIndex() (indexNamespace, indexWork, bool) {
+func (m *Manager) nextIndex(now time.Time) (indexNamespace, indexWork, bool) {
 	m.queueMu.Lock()
 	defer m.queueMu.Unlock()
+	var earliestNS indexNamespace
+	var earliestWork indexWork
+	hasPending := false
 	for ns, work := range m.pending {
-		delete(m.pending, ns)
-		return ns, work, true
+		if !hasPending || work.readyAt.Before(earliestWork.readyAt) {
+			earliestNS = ns
+			earliestWork = work
+			hasPending = true
+		}
+	}
+	if hasPending && !earliestWork.readyAt.After(now) {
+		delete(m.pending, earliestNS)
+		return earliestNS, earliestWork, true
+	}
+	if hasPending {
+		return earliestNS, earliestWork, false
 	}
 	return indexNamespace{}, indexWork{}, false
 }
@@ -98,9 +139,21 @@ func (m *Manager) runIndexWorker(ctx context.Context) {
 		case <-m.wake:
 		}
 		for {
-			ns, work, ok := m.nextIndex()
+			ns, work, ok := m.nextIndex(time.Now())
 			if !ok {
-				break
+				if work.readyAt.IsZero() {
+					break
+				}
+				timer := time.NewTimer(time.Until(work.readyAt))
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-m.wake:
+					timer.Stop()
+				case <-timer.C:
+				}
+				continue
 			}
 			published, err := m.buildAndPublishIndex(ctx, ns, work)
 			if err != nil {

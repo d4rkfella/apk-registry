@@ -219,7 +219,9 @@ secret to mint that token; it does not use GitHub OIDC.
 
 Uploads and deletes enqueue an index rebuild and return without waiting for
 index generation, so clients may briefly see the previous index after a
-mutation. Rebuilds are coalesced per architecture and use a consistent package
+mutation. Each architecture's batch becomes eligible after an initial 100 ms
+window, allowing upload bursts to share fewer index generations; work may wait
+longer if another index build is running. Rebuilds use a consistent package
 snapshot; publication is atomic, and failed builds are logged and retried. On
 startup, existing package directories are scanned to recover pending indexes.
 For v2, the first build, overwrites, deletes, and recovery use a full rebuild;
